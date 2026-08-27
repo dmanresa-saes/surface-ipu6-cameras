@@ -1,0 +1,78 @@
+diff --git a/src/ipa/libipa/awb.h b/src/ipa/libipa/awb.h
+index d35a851..74411dc 100644
+--- a/src/ipa/libipa/awb.h
++++ b/src/ipa/libipa/awb.h
+@@ -117,7 +117,18 @@ public:
+ 	{
+ 		AwbAlgorithmBase::init(tuningData);
+ 
+-		gainMin_ = std::max(Q::TraitsType::min, 1.0f);
++		/*
++		 * Hardware ISPs generally cannot attenuate a channel, hence
++		 * the historical floor of 1.0 -- but the software ISP
++		 * multiplies in a shader and attenuates just fine, and some
++		 * modules genuinely need it: the Surface Pro 7+ OV5693 sees
++		 * ~68% more red relative to green than its lens-shading
++		 * siblings, so a correct white balance needs a red gain well
++		 * below 1.0 at every daylight temperature. With the floor in
++		 * place every scene rendered green. Trust the numeric range
++		 * of the gain type instead, with a small safety floor.
++		 */
++		gainMin_ = std::max(Q::TraitsType::min, 1.0f / 16);
+ 		gainMax_ = Q::TraitsType::max;
+ 
+ 		controls_[&controls::ColourGains] =
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index 63b4154..d1b6a68 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -65,12 +65,27 @@ Agc::Agc()
+ {
+ }
+ 
++int Agc::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	/*
++	 * The MSV the loop drives towards. The 2.5 default centres the
++	 * histogram, which on a scene with a bright background behind a dark
++	 * foreground (a person in front of a lit wall -- this camera's usual
++	 * view) runs hot enough to clip the background, and clipped highlights
++	 * also poison the AWB statistics. Tuning files can lower it.
++	 */
++	exposureOptimal_ =
++		tuningData["exposureOptimal"].get<double>(kExposureOptimal);
++
++	return 0;
++}
++
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
+ {
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
+ 
+-	double error = kExposureOptimal - exposureMSV;
++	double error = exposureOptimal_ - exposureMSV;
+ 
+ 	if (std::abs(error) <= kExposureSatisfactory)
+ 		return;
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index 3694461..8cf35b5 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -19,6 +19,7 @@ public:
+ 	Agc();
+ 	~Agc() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
+ 	void process(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+@@ -26,6 +27,8 @@ public:
+ 
+ private:
+ 	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++
++	float exposureOptimal_;
+ };
+ 
+ } /* namespace ipa::softisp::algorithms */

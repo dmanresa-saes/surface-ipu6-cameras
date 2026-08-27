@@ -1,0 +1,14 @@
+# build leftovers
+*.o
+*.ko
+*.mod*
+*.cmd
+Module.symvers
+modules.order
+__pycache__/
+*.pyc
+
+# never commit vendor material
+*.aiqb
+*.sys
+ipu6-drivers/

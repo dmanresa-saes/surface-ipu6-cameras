@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""Surface Pro 7+ front camera -> v4l2loopback, via the IPU6 hardware ISP.
+
+Producer pipeline (root): icamerasrc (Intel HAL -> ISYS -> PSYS) -> NV12
+1280x720@30 -> videoconvert -> YUY2 -> this daemon -> /dev/video80. The
+gst pipeline writes raw frames to a pipe (fdsink); the daemon owns the
+loopback producer fd, so the device's caps never change for clients
+(YUY2 1280x720, same as the old v4l2-relayd front bridge).
+
+Why not v4l2-relayd (design decision, 2026-08-27):
+ - The HAL start is INTERMITTENT: sometimes the ISYS never delivers a frame
+   ("Poll: Device node fd NN poll timeout"). The proven recovery is SIGINT
+   to the gst process, recycle the ov5693 driver, relaunch -- v4l2-relayd
+   runs its pipeline in-process and has neither a no-frames watchdog nor a
+   way to reload a kernel module between attempts.
+ - Stopping a stuck icamerasrc pipeline in-process can hang in
+   gst_cam_base_src_set_playing; if that hangs v4l2-relayd, systemd's stop
+   escalates to SIGKILL of the whole cgroup -- and kill -9 on a streaming
+   icamerasrc wedges the ISYS firmware until reboot. Here the daemon stays
+   responsive and only ever SIGINTs its child.
+
+Hard rules honoured here (see REPRODUCIR.md section 10):
+ - only ONE icamerasrc instance at a time (the HAL rejects a second);
+ - NEVER kill -9 / SIGTERM a gst with frames flowing; SIGINT, repeated;
+ - a stream with NO frames does die on SIGINT (poll timeouts unblock it).
+"""
+
+import fcntl
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+W, H, FPS = 1280, 720, 30
+FRAME_SIZE = W * H * 2
+LOOPBACK_LABEL = "Surface Front Camera"
+
+GST_CMD = [
+    "gst-launch-1.0", "-q",
+    "icamerasrc", "device-name=0", "!",
+    f"video/x-raw,format=NV12,width={W},height={H}", "!",
+    "videoconvert", "!",
+    f"video/x-raw,format=YUY2,width={W},height={H}", "!",
+    "fdsink", "fd=1",
+]
+
+# How long to wait for the FIRST frame before declaring the HAL start stuck
+# and recycling the sensor driver. A good start delivers in ~2-4 s; the
+# stuck starts deliver nothing at all, so 10 s separates them cleanly.
+FIRST_FRAME_TIMEOUT = 10.0
+MAX_ATTEMPTS = 3
+# How long every client has to be gone before the camera is shut down.
+CLIENT_GRACE = 2.0
+# SIGINT-and-wait budget for the gst child (repeat the SIGINT: historically
+# one is sometimes ignored).
+STOP_BUDGET = 20.0
+
+# --- v4l2 ioctls (same layouts as surface-ir-bridge) ------------------------
+VIDIOC_S_FMT = 0xC0D05605
+VIDIOC_S_PARM = 0xC0CC5616
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565A
+VIDIOC_DQEVENT = 0x80885659  # struct v4l2_event is 136 bytes; wrong size => ENOTTY
+BUF_TYPE_OUTPUT = 2
+FMT_YUYV = 0x56595559
+# v4l2loopback signals this when the number of capturing clients changes.
+V4L2_EVENT_PRI_CLIENT_USAGE = 0x08000000 + 0x08E00000 + 1
+
+DEBUG = os.environ.get("PSYS_BRIDGE_DEBUG")
+
+
+def log(msg):
+    print(f"[{time.monotonic():.3f}] {msg}", flush=True)
+
+
+def find_loopback(label):
+    for name in sorted(os.listdir("/sys/devices/virtual/video4linux")):
+        try:
+            path = f"/sys/devices/virtual/video4linux/{name}/name"
+            if open(path).read().strip() == label:
+                return "/dev/" + name
+        except OSError:
+            pass
+    return None
+
+
+def s_fmt_output(fd):
+    fmt = bytearray(204)
+    struct.pack_into("I", fmt, 0, BUF_TYPE_OUTPUT)
+    struct.pack_into("IIII", fmt, 8, W, H, FMT_YUYV, 1)
+    fcntl.ioctl(fd, VIDIOC_S_FMT, fmt)
+
+
+def s_parm_output(fd):
+    """Advertise 30 fps (v4l2_outputparm.timeperframe = 1/30)."""
+    parm = bytearray(204)
+    struct.pack_into("I", parm, 0, BUF_TYPE_OUTPUT)
+    struct.pack_into("II", parm, 4, 0x1000, 0)   # capability=TIMEPERFRAME, outputmode
+    struct.pack_into("II", parm, 12, 1, FPS)     # timeperframe num/den
+    try:
+        fcntl.ioctl(fd, VIDIOC_S_PARM, parm)
+    except OSError as exc:
+        log(f"S_PARM failed ({exc}); fps stays at the loopback default")
+
+
+def poll_client_count(fd):
+    """Newest capture-client count, or None if unchanged. POLLPRI = the
+    THIRD list select() returns; reading the first one misses every event."""
+    count = None
+    while True:
+        _, _, x = select.select([], [], [fd], 0)
+        if not x:
+            return count
+        ev = bytearray(136)
+        try:
+            fcntl.ioctl(fd, VIDIOC_DQEVENT, ev)
+        except OSError:
+            return count
+        if struct.unpack_from("I", ev, 0)[0] == V4L2_EVENT_PRI_CLIENT_USAGE:
+            count = struct.unpack_from("I", ev, 8)[0]
+
+
+# Black in YUY2: Y=16, U=V=128 (video range; Y=0 also works but this is
+# what videotestsrc pattern=black emits).
+BLACK_FRAME = bytes([16, 128]) * (W * H)
+
+
+def recycle_sensor():
+    """Reload ov5693. /etc/modprobe.d supplies binned_y_offset=1, so a bare
+    modprobe restores the production (PSYS/GRBG) phase."""
+    log("recycling ov5693 driver")
+    subprocess.run(["modprobe", "-r", "ov5693"], check=False)
+    subprocess.run(["modprobe", "ov5693"], check=False)
+    time.sleep(1.0)
+
+
+def stop_gst(proc):
+    """SIGINT the gst child (never SIGTERM/SIGKILL: a streaming icamerasrc
+    must shut down its pipeline or the ISYS firmware wedges until reboot).
+    Returns True once it is gone."""
+    if proc.poll() is not None:
+        return True
+    deadline = time.monotonic() + STOP_BUDGET
+    proc.send_signal(signal.SIGINT)
+    next_int = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        if time.monotonic() >= next_int:
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                return True
+            next_int = time.monotonic() + 4.0
+        time.sleep(0.2)
+    return proc.poll() is not None
+
+
+def other_icamerasrc_running():
+    """Pids of real gst-launch processes with icamerasrc among their argv.
+
+    NOT pgrep -f "gst-launch.*icamerasrc": that also matches any shell whose
+    command STRING happens to contain both words (a test harness, a grep, a
+    copy-pasted psys-test line), and a false positive here kills the session.
+    """
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            argv = open(f"/proc/{entry}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]).startswith(b"gst-launch") \
+                and any(a.startswith(b"icamerasrc") for a in argv[1:]):
+            pids.append(int(entry))
+    return pids
+
+
+class SessionOver(Exception):
+    pass
+
+
+# The live producer, if any, so the shutdown path can stop it. A SIGTERM
+# (systemd stop/restart) raises KeyboardInterrupt ANYWHERE, including inside
+# run_session -- if the daemon then exits with the child alive, systemd
+# SIGKILLs the leftover gst mid-stream, which is exactly the forbidden case
+# (observed 2026-08-27: "Killing process ... with signal SIGKILL", gst in
+# D-state, CSI2 error burst; the ISYS survived that once, do not bet on it).
+CURRENT_PROC = [None]
+
+
+def run_session(out_fd, client_open_t):
+    """Serve one demand session: spawn the producer, relay frames, retry a
+    stuck start with a driver recycle, stop when every client lets go."""
+    others = other_icamerasrc_running()
+    if others:
+        log(f"REFUSING to start: another icamerasrc is running (pid {others});"
+            " close it (psys-test.sh?) -- retrying in 5 s")
+        time.sleep(5.0)
+        # keep retrying while a client is still waiting on the loopback
+        count = poll_client_count(out_fd)
+        return count is None or count > 0
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        log(f"starting producer (attempt {attempt}/{MAX_ATTEMPTS})")
+        proc = subprocess.Popen(GST_CMD, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+        CURRENT_PROC[0] = proc
+        pipe = proc.stdout.fileno()
+        os.set_blocking(pipe, False)
+        try:
+            fcntl.fcntl(pipe, 1031, 1 << 20)  # F_SETPIPE_SZ, 1 MiB
+        except OSError:
+            pass
+
+        buf = bytearray()
+        first_frame_t = None
+        gone_since = None
+        spawn_t = time.monotonic()
+        next_splash = 0.0
+        try:
+            while True:
+                now = time.monotonic()
+
+                # Watchdog: no first frame in time = the known stuck start.
+                if first_frame_t is None and now - spawn_t > FIRST_FRAME_TIMEOUT:
+                    log("no frames from the HAL (stuck start)")
+                    break
+
+                # Splash: keep the waiting client fed with black frames so
+                # its negotiation/first read does not stall.
+                if first_frame_t is None and now >= next_splash:
+                    try:
+                        os.write(out_fd, BLACK_FRAME)
+                    except OSError:
+                        pass
+                    next_splash = now + 1.0 / FPS
+
+                r, _, x = select.select([pipe], [], [out_fd], 0.02)
+
+                if r:
+                    try:
+                        chunk = os.read(pipe, 1 << 20)
+                    except BlockingIOError:
+                        chunk = b""
+                    if chunk == b"" and proc.poll() is not None:
+                        if first_frame_t is None:
+                            log("producer exited before the first frame")
+                            break
+                        raise SessionOver("producer exited")
+                    buf += chunk
+                    while len(buf) >= FRAME_SIZE:
+                        frame = bytes(buf[:FRAME_SIZE])
+                        del buf[:FRAME_SIZE]
+                        if first_frame_t is None:
+                            first_frame_t = time.monotonic()
+                            log(f"first frame: {first_frame_t - spawn_t:.2f} s"
+                                f" after spawn, {first_frame_t - client_open_t:.2f} s"
+                                f" after client open (attempt {attempt})")
+                        try:
+                            os.write(out_fd, frame)
+                        except OSError as exc:
+                            raise SessionOver(f"loopback write failed: {exc}")
+
+                count = poll_client_count(out_fd)
+                if count is not None:
+                    gone_since = None if count else time.monotonic()
+                    if DEBUG:
+                        log(f"clients: {count}")
+                if gone_since and time.monotonic() - gone_since > CLIENT_GRACE:
+                    raise SessionOver("all clients gone")
+
+        except SessionOver as exc:
+            log(f"session over: {exc}")
+            if not stop_gst(proc):
+                log("FATAL: gst will not die on SIGINT; NOT touching the "
+                    "driver (reload under a live stream wedges the ISYS). "
+                    "A reboot is the only cure. Exiting.")
+                sys.exit(1)
+            # If the producer died on its own while clients are still
+            # attached, no new client-usage event will fire -- ask the
+            # serve loop to start a fresh session for them.
+            if str(exc) == "producer exited" and gone_since is None:
+                time.sleep(1.0)
+                return True
+            return False
+
+        # Stuck start: SIGINT (a frameless stream does die on it), recycle
+        # the sensor, try again.
+        if not stop_gst(proc):
+            log("FATAL: stuck gst will not die on SIGINT; exiting (reboot needed)")
+            sys.exit(1)
+        if attempt < MAX_ATTEMPTS:
+            recycle_sensor()
+
+    log(f"giving up after {MAX_ATTEMPTS} attempts (HAL never delivered)")
+    time.sleep(2.0)
+    return False
+
+
+def _terminate(signum, frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def main():
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
+
+    loopback = find_loopback(LOOPBACK_LABEL)
+    if not loopback:
+        sys.exit(f"no v4l2loopback device labelled {LOOPBACK_LABEL!r}")
+    if not os.path.exists("/dev/ipu-psys0"):
+        sys.exit("/dev/ipu-psys0 missing -- intel-ipu6-psys not loaded (DKMS?)")
+
+    out_fd = os.open(loopback, os.O_RDWR)
+    s_fmt_output(out_fd)
+    s_parm_output(out_fd)
+    # v4l2loopback only advertises CAPTURE once a producer has written
+    # something; without this nothing could open the device and the
+    # client-usage event below would never fire.
+    os.write(out_fd, BLACK_FRAME)
+
+    sub = bytearray(32)
+    struct.pack_into("I", sub, 0, V4L2_EVENT_PRI_CLIENT_USAGE)
+    fcntl.ioctl(out_fd, VIDIOC_SUBSCRIBE_EVENT, sub)
+
+    log(f"serving {loopback} (front camera via IPU6 PSYS), waiting for clients")
+    try:
+        while True:
+            select.select([], [], [out_fd])
+            if poll_client_count(out_fd):
+                t = time.monotonic()
+                log("client opened")
+                while run_session(out_fd, t):
+                    t = time.monotonic()
+                log("idle")
+    except KeyboardInterrupt as exc:
+        log(f"stopping: {exc}")
+    finally:
+        # Never leave the producer to systemd's final SIGKILL: stop it here,
+        # with SIGINT and patience, before the main process exits. A second
+        # SIGTERM must not abort this teardown, so ignore signals from now on.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        proc = CURRENT_PROC[0]
+        if proc is not None and proc.poll() is None:
+            log("shutting down producer (SIGINT)")
+            if not stop_gst(proc):
+                log("FATAL: producer ignored SIGINT during shutdown; "
+                    "a reboot may be needed (do NOT kill -9 it)")
+
+
+if __name__ == "__main__":
+    main()

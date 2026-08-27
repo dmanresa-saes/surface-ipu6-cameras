@@ -1,0 +1,90 @@
+#!/bin/bash
+# On-demand bridge: a Surface Pro 7+ colour camera -> v4l2loopback, via
+# libcamera's software ISP. v4l2-relayd only runs the pipeline while an
+# application has the loopback device open.
+#
+# Usage: surface-camera-relayd front|rear
+set -e
+
+# BINNED=1 asks libcamera for the output size directly, with no oversized
+# render pass. The simple pipeline picks the sensor mode from the requested
+# output size (its debayer keeps a 2-pixel border, so a 1296-wide binned
+# readout can serve at most 1292): asking for 1280x720 is what selects the
+# OV5693's 2x2-binned mode, which gathers 4x the light per pixel and is the
+# difference between the AGC running at analogue gain ~15 and it being pinned
+# at the 127 ceiling. The rear OV8865 has no working binned mode, so it keeps
+# the render-large-and-downscale path.
+case "${1:-front}" in
+  front) CAM_ID='\\_SB_.PC00.I2C2.CAMF'; LABEL="Surface Front Camera"
+         BINNED=1 ;;
+  rear)  CAM_ID='\\_SB_.PC00.I2C3.CAMR'; LABEL="Surface Rear Camera"
+         BINNED=0 ;;
+  *)     echo "usage: $0 front|rear" >&2; exit 2 ;;
+esac
+
+OUT_W="${OUT_W:-1280}"
+OUT_H="${OUT_H:-720}"
+OUT_FPS="${OUT_FPS:-30/1}"
+
+export GST_PLUGIN_PATH=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
+
+DEVICE=$(grep -l -m1 -F -x "$LABEL" /sys/devices/virtual/video4linux/*/name | cut -d/ -f6)
+if [ -z "$DEVICE" ]; then
+    echo "no v4l2loopback device labelled '$LABEL'" >&2
+    exit 1
+fi
+
+# camera-name: the libcamera id is an ACPI path starting with a backslash.
+# gst_parse_launch() eats one level of backslash, hence the doubling.
+#
+# Note there is no sensor-config here: the "simple" pipeline handler never
+# implemented SensorConfiguration, so that property was always a no-op. The
+# sensor mode is steered entirely by the requested output size.
+INPUT="libcamerasrc camera-name=$CAM_ID"
+if [ "$BINNED" = 1 ]; then
+    INPUT+=" ! video/x-raw,width=$OUT_W,height=$OUT_H"
+    INPUT+=" ! videorate skip-to-first=true"
+    INPUT+=" ! video/x-raw,framerate=$OUT_FPS"
+else
+    # Render larger than the output: the software ISP emits black frames when
+    # asked for less than ~1296 px wide from a full-resolution readout.
+    #
+    # 1600x900 rather than the obvious 1920x1080: at exactly 1920 wide the
+    # software ISP lays a dark column down 63% of the frame -- reproducible to
+    # the same pixel (x=1211), about 23% below its neighbours, and absent from
+    # the raw Bayer. At 1600x900 the worst column is 1.5% off and lands
+    # somewhere different every run, which is just noise.
+    INPUT+=" ! video/x-raw,width=1600,height=900"
+    # skip-to-first: v4l2-relayd keeps one clock for the splash and the
+    # camera, so by the time a client shows up the pipeline's running time is
+    # however long the daemon has been idle. Without this, videorate treats
+    # that as a gap to fill and repeats the first frame for every missing
+    # slot -- a picture frozen for as long as the relay had been waiting.
+    INPUT+=" ! videoscale ! videorate skip-to-first=true"
+    INPUT+=" ! video/x-raw,width=$OUT_W,height=$OUT_H,framerate=$OUT_FPS"
+fi
+# End on a real element: v4l2-relayd links its appsink (which carries the
+# YUY2 output caps) to the last unlinked src pad, and videoconvert is what
+# turns libcamera's ABGR into YUY2.
+INPUT+=" ! videoconvert"
+
+OUTPUT="appsrc name=appsrc caps=video/x-raw,format=YUY2,width=$OUT_W,height=$OUT_H,framerate=$OUT_FPS"
+# sync=false: libcamerasrc timestamps its buffers off the sensor clock, which
+# does not line up with the running time of the pipeline v4l2-relayd builds
+# around its appsrc. Left to synchronise, v4l2sink sits on every frame waiting
+# for a deadline that never matches and the device trickles out ~1 fps, which
+# looks exactly like a frozen picture. There is nothing to sync to here anyway:
+# the loopback just wants frames as they arrive.
+OUTPUT+=" ! videoconvert ! v4l2sink name=v4l2sink sync=false device=/dev/$DEVICE"
+
+# v4l2-relayd's built-in splash is a 16x16 black PNG behind "imagefreeze
+# num-buffers=2", which runs dry after two buffers. Once it has, the shared
+# appsrc never recovers when the camera pipeline takes over: the loopback
+# keeps handing out black frames at a few fps for as long as the client is
+# open. A live source of the right size and rate keeps the appsrc fed until
+# libcamera has its first frame ready.
+SPLASH="videotestsrc pattern=black is-live=true"
+SPLASH+=" ! video/x-raw,width=$OUT_W,height=$OUT_H,framerate=$OUT_FPS"
+SPLASH+=" ! videoconvert"
+
+exec /usr/local/bin/v4l2-relayd -i "$INPUT" -o "$OUTPUT" -s "$SPLASH"

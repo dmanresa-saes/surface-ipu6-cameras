@@ -1,0 +1,17 @@
+#!/bin/bash
+# Create the two loopback devices the Surface camera bridges feed.
+#
+# The module's card_label parameter cannot express two labels containing
+# spaces, so the devices are added at runtime instead. Do NOT pin the format
+# with set-caps: with exclusive_caps=1 a pinned device advertises CAPTURE to
+# everyone, and then the producers (v4l2sink, the IR bridge) can no longer
+# open it for output. Each producer marks itself by writing a frame instead.
+set -e
+modprobe v4l2loopback
+add() {  # nr label
+    [ -e "/dev/video$1" ] && return 0
+    /usr/local/bin/v4l2loopback-ctl add --exclusive-caps 1 --name "$2" "/dev/video$1" >/dev/null
+}
+add 80 "Surface Front Camera"
+add 81 "Surface IR Camera"
+add 82 "Surface Rear Camera"

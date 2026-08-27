@@ -1,0 +1,36 @@
+--- a/src/core/psysprocessor/PGUtils.cpp
++++ b/src/core/psysprocessor/PGUtils.cpp
+@@ -232,6 +232,9 @@
+     int stride = width;
+     switch (cssFmt) {
+         case IA_CSS_DATA_FORMAT_BAYER_GRBG:  // GR10
++        case IA_CSS_DATA_FORMAT_BAYER_BGGR:  // BG10 (e.g. OV5693 with sensor vflip)
++        case IA_CSS_DATA_FORMAT_BAYER_RGGB:
++        case IA_CSS_DATA_FORMAT_BAYER_GBRG:
+         case IA_CSS_DATA_FORMAT_RAW:         // BA10
+             stride = ALIGN_64(width * 2);
+             break;
+--- a/src/iutils/Utils.cpp
++++ b/src/iutils/Utils.cpp
+@@ -392,6 +392,9 @@
+         case GET_FOURCC_FMT('b', 'V', '0', 'K'):  // BV0K
+         case GET_FOURCC_FMT('B', 'A', '1', '0'):  // BA10
+         case GET_FOURCC_FMT('G', 'R', '1', '0'):  // GR10
++        case GET_FOURCC_FMT('B', 'G', '1', '0'):  // BG10 (BGGR bayer, e.g. OV5693 vflip)
++        case GET_FOURCC_FMT('R', 'G', '1', '0'):  // RG10
++        case GET_FOURCC_FMT('G', 'B', '1', '0'):  // GB10
+         case GET_FOURCC_FMT('B', 'A', '1', '2'):  // BA12
+         case GET_FOURCC_FMT('P', '0', '1', '0'):  // P010
+         case GET_FOURCC_FMT('P', '0', '1', 'L'):  // P010_LSB
+--- a/src/core/psysprocessor/PipeLiteExecutor.cpp
++++ b/src/core/psysprocessor/PipeLiteExecutor.cpp
+@@ -506,7 +506,8 @@
+      *     PG use its kernel to crop to GRBG
+      */
+     if ((internalFormat == V4L2_PIX_FMT_SGRBG10 || internalFormat == V4L2_PIX_FMT_SGRBG12) &&
+-        (external.format == V4L2_PIX_FMT_SRGGB10 || external.format == V4L2_PIX_FMT_SRGGB12)) {
++        (external.format == V4L2_PIX_FMT_SRGGB10 || external.format == V4L2_PIX_FMT_SRGGB12 ||
++         external.format == V4L2_PIX_FMT_SBGGR10 || external.format == V4L2_PIX_FMT_SBGGR12)) {
+         return true;
+     }
+ 

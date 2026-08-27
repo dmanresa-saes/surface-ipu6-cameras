@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# Colour tuning for the OV5693 as wired on the Surface Pro 7+.
+#
+# The colour correction matrices are Raspberry Pi's measured OV5647 set
+# (libcamera src/ipa/rpi/vc4/data/ov5647.json). The OV5647 is not this
+# sensor, but it is the closest thing anyone has published: same vendor,
+# same 5 MP generation, same 2592x1944 Bayer array. Borrowing its CCMs is
+# an approximation -- the colour filter dyes and the module's IR-cut filter
+# are not identical -- but it is a far better starting point than what
+# libcamera falls back to without a tuning file, which is no colour
+# correction at all.
+#
+# Awb has no colourGains curve here on purpose. The grey-world algorithm
+# estimates the colour temperature straight from the frame
+# (AwbGrey::estimateCCT), which is what the Ccm interpolation needs; the
+# curve only feeds the manual-colour-temperature control, and a curve
+# borrowed from a different sensor would make that worse, not better.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+  # Bayesian AWB instead of the grey-world default. Grey world assumes the
+  # scene averages to neutral, which this camera's usual scene (a person, a
+  # wall, one dominant colour) rarely does -- a red curtain filling half the
+  # frame pushed everything cyan/green. The bayes search constrains the gains
+  # to the colour-temperature curve below.
+  #
+  # colourGains: derived from THIS module's OEM tuning. Microsoft ships the
+  # Intel .aiqb calibration (OV5693_MSHW0220_TGL.aiqb) inside the public
+  # Surface Pro 7+ driver MSI; the advanced-color-matrix record stores, per
+  # illuminant (A/F4/F11/F2/D50/D65/D75), the sensor white point as R/G,B/G
+  # chromaticity. Gains are the reciprocals; CT comes from the record's CIE
+  # coordinates (McCamy). See w11-ref/aiqb-real/decode_aiqb.py.
+  # The whole curve is then scaled per-channel (r x1.20, b x1.08 net) to this
+  # PHYSICAL unit, anchored on a white wall under the room's ceiling light,
+  # matched to how the Windows stack renders the same wall (G/R=0.965,
+  # G/B=1.006). Note the tungsten red gain sits below 1.0 -- that is why the
+  # gainMin_ patch in libcamera's src/ipa/libipa/awb.h is required.
+  - Awb:
+      algorithm: bayes
+      colourGains:
+        - ct: 2592
+          gains: [ 1.037, 2.790 ]
+        - ct: 2773
+          gains: [ 1.237, 2.689 ]
+        - ct: 3716
+          gains: [ 1.590, 2.192 ]
+        - ct: 3763
+          gains: [ 1.645, 2.171 ]
+        - ct: 4877
+          gains: [ 1.727, 1.740 ]
+        - ct: 5894
+          gains: [ 1.960, 1.573 ]
+        - ct: 6905
+          gains: [ 2.151, 1.452 ]
+      transversePos: 0.03
+      transverseNeg: 0.03
+      priors:
+        - lux: 0
+          ct: [ 2000, 13000 ]
+          probability: [ 1.0, 1.0 ]
+      # CT search ranges per V4L2 AWB mode; bayes refuses to start without
+      # them (the tuning key is the control name "AwbMode"), and AwbAuto is the default the wrapper registers. Bounds stay
+      # inside the colourGains span (2500..8625) so every mode lands on the
+      # measured part of the curve.
+      AwbMode:
+        AwbAuto:
+          lo: 2592
+          hi: 6905
+        AwbIncandescent:
+          lo: 2500
+          hi: 3000
+        AwbTungsten:
+          lo: 3000
+          hi: 3500
+        AwbFluorescent:
+          lo: 4000
+          hi: 4700
+        AwbDaylight:
+          lo: 5500
+          hi: 6500
+        AwbCloudy:
+          lo: 7000
+          hi: 8500
+  # CCMs: the OEM 'traditional' matrices from the same .aiqb record, one per
+  # illuminant, then globally strengthened x1.28 toward saturation (extrapolated
+  # blend M'=K*M+(1-K)*I, rows still sum to 1) because the Windows pipeline adds
+  # saturation preference on top of the accurate matrices: with the plain OEM
+  # CCMs the red curtain measured HSV-sat 0.45 where the W11 capture of the same
+  # scene under the same light measures 0.64. Final: 0.654.
+  - Ccm:
+      ccms:
+        - ct: 2592
+          ccm: [  1.9808, -0.4749, -0.5056,
+                 -0.6684,  2.1544, -0.4860,
+                 -0.5242, -1.8228,  3.3471 ]
+        - ct: 2773
+          ccm: [  2.1986, -0.9864, -0.2122,
+                 -0.7359,  2.1626, -0.4264,
+                 -0.2464, -1.4841,  2.7305 ]
+        - ct: 3716
+          ccm: [  2.2949, -1.1377, -0.1572,
+                 -0.5846,  2.0326, -0.4481,
+                 -0.1379, -1.0260,  2.1638 ]
+        - ct: 3763
+          ccm: [  2.2515, -1.0836, -0.1676,
+                 -0.5637,  2.1049, -0.5412,
+                 -0.0962, -1.2263,  2.3225 ]
+        - ct: 4877
+          ccm: [  2.0780, -0.8023, -0.2755,
+                 -0.4319,  1.9676, -0.5358,
+                 -0.1268, -0.9285,  2.0556 ]
+        - ct: 5894
+          ccm: [  2.0637, -0.8381, -0.2258,
+                 -0.4043,  2.1383, -0.7340,
+                 -0.1010, -0.9164,  2.0173 ]
+        - ct: 6905
+          ccm: [  2.1656, -0.9687, -0.1969,
+                 -0.3738,  2.1203, -0.7465,
+                 -0.0803, -0.8685,  1.9489 ]
+  - Adjust:
+  # 0.12 rather than the 0.16 default: this camera's usual scene (a lit wall
+  # behind a dark foreground) runs the default hot enough to clip the wall --
+  # the vendor stack exposes the same scene around 115/255. Clipped highlights
+  # also poison the AWB statistics, which then mis-estimate the illuminant.
+  - Agc:
+      # MSV target (default 2.5 centres the histogram). Lowered so the lit
+      # wall behind a dark foreground stays below clipping -- the vendor
+      # stack exposes this scene around 115/255, the 2.5 default ran it at
+      # ~147 with the wall solid 255, and clipped highlights also poison the
+      # AWB statistics.
+      exposureOptimal: 2.1

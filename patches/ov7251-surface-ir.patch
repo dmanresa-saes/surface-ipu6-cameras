@@ -1,0 +1,102 @@
+--- a/drivers/media/i2c/ov7251.c
++++ b/drivers/media/i2c/ov7251.c
+@@ -23,6 +23,30 @@
+ #include <media/v4l2-fwnode.h>
+ #include <media/v4l2-subdev.h>
+ 
++/*
++ * The Windows-Hello IR illuminator hangs off the sensor's strobe output.
++ * Nothing in ACPI describes it -- the INT3472 for this camera declares only a
++ * power-enable and a reset GPIO -- so without programming it here the sensor
++ * sees a completely black scene: the module sits behind an IR-pass filter and
++ * room lighting emits next to nothing in the infrared.
++ *
++ * Two registers matter, both read out of the mode tables in the vendor's
++ * ov7251.sys:
++ *
++ *   0x3005  pad output value; 0x08 routes the strobe to the illuminator.
++ *   0x3b81  strobe pattern, one bit per frame. The vendor writes 0xff for its
++ *           illuminated modes and 0xa5 for the rest. 0xa5 is 10100101, so the
++ *           illuminator fires on half the frames: the LED blinks visibly and
++ *           every second frame comes out black. This driver's global init
++ *           programs 0xa5, hence the need to override it.
++ */
++#define OV7251_PAD_OUT1			0x3005
++#define OV7251_PAD_OUT1_IR_LED		0x08
++#define OV7251_STROBE_PATTERN		0x3b81
++#define OV7251_STROBE_EVERY_FRAME	0xff
++#define OV7251_STROBE_HALF_FRAMES	0xa5
++
++
+ #define OV7251_SC_MODE_SELECT		0x0100
+ #define OV7251_SC_MODE_SELECT_SW_STANDBY	0x0
+ #define OV7251_SC_MODE_SELECT_STREAMING		0x1
+@@ -1053,7 +1077,7 @@
+ 	case V4L2_CID_EXPOSURE:
+ 		ret = ov7251_set_exposure(ov7251, ctrl->val);
+ 		break;
+-	case V4L2_CID_GAIN:
++	case V4L2_CID_ANALOGUE_GAIN:
+ 		ret = ov7251_set_gain(ov7251, ctrl->val);
+ 		break;
+ 	case V4L2_CID_TEST_PATTERN:
+@@ -1334,6 +1358,36 @@
+ 	return 0;
+ }
+ 
++static int ir_led = -1;
++module_param(ir_led, int, 0644);
++MODULE_PARM_DESC(ir_led,
++		 "IR illuminator while streaming: -1 auto (on for ACPI INT347E), 0 off, 1 on");
++
++static bool ov7251_has_ir_led(struct ov7251 *ov7251)
++{
++	if (ir_led >= 0)
++		return ir_led;
++
++	return acpi_dev_hid_uid_match(ACPI_COMPANION(ov7251->dev), "INT347E", NULL);
++}
++
++static int ov7251_ir_led_set(struct ov7251 *ov7251, bool on)
++{
++	int ret;
++
++	if (!ov7251_has_ir_led(ov7251))
++		return 0;
++
++	ret = ov7251_write_reg(ov7251, OV7251_PAD_OUT1,
++			       on ? OV7251_PAD_OUT1_IR_LED : 0);
++	if (ret)
++		return ret;
++
++	return ov7251_write_reg(ov7251, OV7251_STROBE_PATTERN,
++				on ? OV7251_STROBE_EVERY_FRAME :
++				     OV7251_STROBE_HALF_FRAMES);
++}
++
+ static int ov7251_s_stream(struct v4l2_subdev *subdev, int enable)
+ {
+ 	struct ov7251 *ov7251 = to_ov7251(subdev);
+@@ -1372,7 +1426,13 @@
+ 				       OV7251_SC_MODE_SELECT_STREAMING);
+ 		if (ret)
+ 			goto err_power_down;
++
++		ret = ov7251_ir_led_set(ov7251, true);
++		if (ret)
++			goto err_power_down;
+ 	} else {
++		ov7251_ir_led_set(ov7251, false);
++
+ 		ret = ov7251_write_reg(ov7251, OV7251_SC_MODE_SELECT,
+ 				       OV7251_SC_MODE_SELECT_SW_STANDBY);
+ 		pm_runtime_put(ov7251->dev);
+@@ -1579,7 +1639,7 @@
+ 	ov7251->exposure = v4l2_ctrl_new_std(&ov7251->ctrls, &ov7251_ctrl_ops,
+ 					     V4L2_CID_EXPOSURE, 1, 32, 1, 32);
+ 	ov7251->gain = v4l2_ctrl_new_std(&ov7251->ctrls, &ov7251_ctrl_ops,
+-					 V4L2_CID_GAIN, 16, 1023, 1, 16);
++					 V4L2_CID_ANALOGUE_GAIN, 16, 1023, 1, 16);
+ 	v4l2_ctrl_new_std_menu_items(&ov7251->ctrls, &ov7251_ctrl_ops,
+ 				     V4L2_CID_TEST_PATTERN,
+ 				     ARRAY_SIZE(ov7251_test_pattern_menu) - 1,

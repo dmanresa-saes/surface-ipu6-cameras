@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Surface Pro 7+ IR camera (OV7251 + Intel IPU6) -> v4l2loopback.
+
+The IPU6 ISYS hands out the sensor's raw Y10 (10 bits in a 16-bit word) and
+nothing else: 'GREY', 'Y16 ' and the packed variants are all rejected by the
+driver, and libcamera's software ISP only knows how to debayer colour sensors,
+so it exposes this camera as raw-only too. Face-recognition tools (howdy) want
+an ordinary 8-bit greyscale device, so convert here.
+
+Streaming is started only while an application has the loopback device open,
+which matters more than usual: the IR illuminator is lit for as long as the
+sensor streams.
+"""
+
+import ctypes
+import fcntl
+import signal
+import mmap
+import os
+import select
+import struct
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+IR_W, IR_H = 640, 480
+TARGET_MEAN = 110          # 8-bit target for the exposure loop
+EXPOSURE_MIN, EXPOSURE_MAX = 2, 1704   # in lines
+GAIN_MIN, GAIN_MAX = 16, 1023
+DIGITAL_MAX = 6.0          # last resort once the sensor is maxed out
+
+LOOPBACK_LABEL = "Surface IR Camera"
+
+# --- v4l2 ioctls -----------------------------------------------------------
+VIDIOC_S_FMT = 0xC0D05605
+VIDIOC_REQBUFS = 0xC0145608
+VIDIOC_QUERYBUF = 0xC0585609
+VIDIOC_QBUF = 0xC058560F
+VIDIOC_DQBUF = 0xC0585611
+VIDIOC_STREAMON = 0x40045612
+VIDIOC_STREAMOFF = 0x40045613
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565A
+# _IOR('V', 89, struct v4l2_event); the struct is 136 bytes, and encoding
+# the wrong size here makes the ioctl fail with ENOTTY, which used to be
+# swallowed as "no event" -- so a client letting go was never noticed and
+# the IR illuminator stayed lit.
+VIDIOC_DQEVENT = 0x80885659
+
+BUF_TYPE_CAPTURE = 1
+BUF_TYPE_OUTPUT = 2
+MEMORY_MMAP = 1
+
+FMT_Y10 = 0x20303159    # 'Y10 '
+FMT_YUYV = 0x56595559   # 'YUYV' -- browsers do not accept plain 'GREY'
+
+# v4l2loopback signals this when the number of capturing clients changes.
+V4L2_EVENT_PRI_CLIENT_USAGE = 0x08000000 + 0x08E00000 + 1
+
+# How long every client has to be gone before the sensor is powered down.
+CLIENT_GRACE = 2.0
+
+
+def find_loopback(label):
+    for name in sorted(os.listdir("/sys/devices/virtual/video4linux")):
+        path = f"/sys/devices/virtual/video4linux/{name}/name"
+        try:
+            if open(path).read().strip() == label:
+                return "/dev/" + name
+        except OSError:
+            pass
+    return None
+
+
+def find_subdev(sensor):
+    for name in sorted(os.listdir("/sys/class/video4linux")):
+        if not name.startswith("v4l-subdev"):
+            continue
+        entity = open(f"/sys/class/video4linux/{name}/name").read().strip()
+        if entity.startswith(sensor + " "):
+            return "/dev/" + name, entity
+    return None, None
+
+
+def media_ctl(*args):
+    subprocess.run(["media-ctl", "-d", "/dev/media0", *args],
+                   check=False, capture_output=True)
+
+
+def setup_graph(entity):
+    """Point the sensor's CSI-2 receiver at its capture node and agree on Y10.
+
+    Has to be redone before every session, not once at start-up: the libcamera
+    relays for the colour cameras reconfigure the same media device, and that
+    severs this link (STREAMON then fails with ENOLINK).
+    """
+    out = subprocess.run(["media-ctl", "-d", "/dev/media0", "-p"],
+                         capture_output=True, text=True).stdout
+
+    csi = None
+    current = None
+    for line in out.splitlines():
+        if "entity " in line and "CSI2" in line:
+            current = line.split(": ", 1)[1].split(" (")[0]
+        if f'"{entity}":0' in line and "ENABLED" in line and current:
+            csi = current
+            break
+    if not csi:
+        raise RuntimeError(f"no CSI-2 receiver linked to {entity}")
+
+    # The capture entity's number is not port * 8, so read it off the graph
+    # and then map that name to a /dev/video node.
+    cap = None
+    inside = want = False
+    for line in out.splitlines():
+        if line.startswith("- entity"):
+            inside = f": {csi} (" in line
+            want = False
+            continue
+        if not inside:
+            continue
+        if "pad1: Source" in line:
+            want = True
+        elif want and '-> "Intel IPU6 ISYS Capture' in line:
+            cap = line.split('-> "', 1)[1].split('"', 1)[0]
+            break
+    if not cap:
+        raise RuntimeError(f"no capture entity on {csi} pad1")
+
+    node = None
+    for name in sorted(os.listdir("/sys/class/video4linux")):
+        if not name.startswith("video"):
+            continue
+        if open(f"/sys/class/video4linux/{name}/name").read().strip() == cap:
+            node = "/dev/" + name
+    if not node:
+        raise RuntimeError(f"no /dev/video node named {cap!r}")
+
+    fmt = f"[fmt:Y10_1X10/{IR_W}x{IR_H}]"
+    media_ctl("-l", f'"{csi}":1 -> "{cap}":0 [1]')
+    media_ctl("-V", f'"{entity}":0 {fmt}')
+    media_ctl("-V", f'"{csi}":0 {fmt}')
+    media_ctl("-V", f'"{csi}":1 {fmt}')
+    return node, csi
+
+
+DEBUG = os.environ.get("IR_BRIDGE_DEBUG")
+
+
+def set_ctrls(subdev, exposure, gain):
+    r = subprocess.run(["v4l2-ctl", "-d", subdev, "--set-ctrl",
+                        f"exposure={exposure},analogue_gain={gain}"],
+                       check=False, capture_output=True, text=True)
+    if DEBUG:
+        print(f"  set exposure={exposure} gain={gain} rc={r.returncode} "
+              f"{r.stderr.strip()}{r.stdout.strip()}", flush=True)
+
+
+def s_fmt(fd, buf_type, pixfmt, width, height):
+    fmt = bytearray(204)
+    struct.pack_into("I", fmt, 0, buf_type)
+    struct.pack_into("IIII", fmt, 8, width, height, pixfmt, 1)
+    fcntl.ioctl(fd, VIDIOC_S_FMT, fmt)
+    bytesperline = struct.unpack_from("I", fmt, 8 + 16)[0]
+    sizeimage = struct.unpack_from("I", fmt, 8 + 20)[0]
+    return bytesperline, sizeimage
+
+
+def buffer_struct(index, buf_type):
+    b = bytearray(88)
+    struct.pack_into("I", b, 0, index)
+    struct.pack_into("I", b, 4, buf_type)
+    struct.pack_into("I", b, 60, MEMORY_MMAP)
+    return b
+
+
+class Capture:
+    """mmap capture from the IPU6 ISYS node."""
+
+    def __init__(self, node, nbufs=6):
+        self.fd = os.open(node, os.O_RDWR)
+        self.maps = []
+        try:
+            self._setup(nbufs)
+        except BaseException:
+            # Leaking the fd here would make every later session fail with
+            # EBUSY on this node, forever.
+            self.close()
+            raise
+
+    def _setup(self, nbufs):
+        self.bpl, _ = s_fmt(self.fd, BUF_TYPE_CAPTURE, FMT_Y10, IR_W, IR_H)
+        self.stride = self.bpl // 2
+
+        rb = bytearray(20)
+        struct.pack_into("IIII", rb, 0, nbufs, BUF_TYPE_CAPTURE, MEMORY_MMAP, 0)
+        fcntl.ioctl(self.fd, VIDIOC_REQBUFS, rb)
+        self.count = struct.unpack_from("I", rb, 0)[0]
+
+        for i in range(self.count):
+            b = buffer_struct(i, BUF_TYPE_CAPTURE)
+            fcntl.ioctl(self.fd, VIDIOC_QUERYBUF, b)
+            length = struct.unpack_from("I", b, 72)[0]
+            offset = struct.unpack_from("I", b, 64)[0]
+            self.maps.append(mmap.mmap(self.fd, length, mmap.MAP_SHARED,
+                                       mmap.PROT_READ, offset=offset))
+            fcntl.ioctl(self.fd, VIDIOC_QBUF, buffer_struct(i, BUF_TYPE_CAPTURE))
+
+        fcntl.ioctl(self.fd, VIDIOC_STREAMON, struct.pack("I", BUF_TYPE_CAPTURE))
+
+    def frame(self, timeout=2.0):
+        r, _, _ = select.select([self.fd], [], [], timeout)
+        if not r:
+            return None
+        b = bytearray(88)
+        struct.pack_into("I", b, 4, BUF_TYPE_CAPTURE)
+        struct.pack_into("I", b, 60, MEMORY_MMAP)
+        fcntl.ioctl(self.fd, VIDIOC_DQBUF, b)
+        idx = struct.unpack_from("I", b, 0)[0]
+        raw = np.frombuffer(self.maps[idx], dtype="<u2",
+                            count=self.stride * IR_H)
+        img = raw.reshape(IR_H, self.stride)[:, :IR_W].copy()
+        fcntl.ioctl(self.fd, VIDIOC_QBUF, b)
+        return img
+
+    def close(self):
+        if self.fd is None:
+            return
+        try:
+            fcntl.ioctl(self.fd, VIDIOC_STREAMOFF,
+                        struct.pack("I", BUF_TYPE_CAPTURE))
+        except OSError:
+            pass
+        for m in self.maps:
+            m.close()
+        self.maps = []
+        os.close(self.fd)
+        self.fd = None
+
+
+def run_session(entity, subdev, out_fd):
+    """Pump frames until every client has let go of the loopback."""
+    # The media graph has to be rebuilt every session, not once at start-up:
+    # the libcamera relays for the colour cameras reconfigure the same media
+    # device and sever this link. Do NOT re-run S_FMT on the loopback here --
+    # once a reader has the format negotiated it answers EBUSY.
+    node, _ = setup_graph(entity)
+    exposure, gain, digital = 800, 256, 1.0
+    gone_since = None
+    set_ctrls(subdev, exposure, gain)
+    cap = Capture(node)
+    yuyv = np.empty((IR_H, IR_W, 2), dtype=np.uint8)
+    yuyv[..., 1] = 128
+    try:
+        last_ae = 0.0
+        while True:
+            img = cap.frame()
+            if img is None:
+                break
+
+            # 10 bits -> 8, with a digital top-up for when the sensor has
+            # already run out of exposure and analogue gain (which it does
+            # indoors: the illuminator only lights what is close to it).
+            if digital == 1.0:
+                out = (img >> 2).astype(np.uint8)
+            else:
+                out = np.clip(img.astype(np.float32) * (digital / 4.0),
+                              0, 255).astype(np.uint8)
+            mean = float(out.mean())
+
+            # Grey -> YUYV with neutral chroma. Browsers and most apps refuse
+            # a plain 8-bit greyscale device, so hand them a packed 4:2:2 one.
+            yuyv[..., 0] = out
+            try:
+                os.write(out_fd, yuyv.tobytes())
+            except BrokenPipeError:
+                break
+
+            now = time.monotonic()
+            if now - last_ae > 0.25:
+                last_ae = now
+                if DEBUG:
+                    print(f"  mean={mean:.1f} exposure={exposure} "
+                          f"gain={gain} digital={digital:.2f}", flush=True)
+                if not TARGET_MEAN * 0.75 <= mean <= TARGET_MEAN * 1.3:
+                    factor = min(max(TARGET_MEAN / max(mean, 1.0), 0.4), 2.0)
+
+                    # Spend the correction on the cheapest knob first:
+                    # digital gain is given back before touching the sensor,
+                    # then exposure time, then analogue gain (noisiest).
+                    prev = (exposure, gain)
+                    if factor < 1 and digital > 1.0:
+                        digital = max(digital * factor, 1.0)
+                    elif factor < 1 and gain > GAIN_MIN:
+                        gain = max(int(gain * factor), GAIN_MIN)
+                    elif factor < 1:
+                        exposure = max(int(exposure * factor), EXPOSURE_MIN)
+                    elif exposure < EXPOSURE_MAX:
+                        exposure = min(int(exposure * factor), EXPOSURE_MAX)
+                    elif gain < GAIN_MAX:
+                        gain = min(int(gain * factor), GAIN_MAX)
+                    else:
+                        digital = min(digital * factor, DIGITAL_MAX)
+                    if (exposure, gain) != prev:
+                        set_ctrls(subdev, exposure, gain)
+
+            # Players open the device, probe it, close it and open it again
+            # before settling. Quitting on the first count=0 would end the
+            # session during that probe, so let the gap play out first.
+            count = poll_client_count(out_fd)
+            if count is not None:
+                gone_since = None if count else time.monotonic()
+            if gone_since and time.monotonic() - gone_since > CLIENT_GRACE:
+                break
+    finally:
+        cap.close()
+
+
+def poll_client_count(fd):
+    """Newest client count the loopback has reported, or None if unchanged.
+
+    V4L2 signals these on the exceptional set (POLLPRI), which is the third
+    list select() returns -- reading the first one instead always yields the
+    empty read set, so a client letting go is never noticed and the sensor
+    (with it the IR illuminator) stays lit.
+    """
+    count = None
+    while True:
+        _, _, x = select.select([], [], [fd], 0)
+        if not x:
+            return count
+        ev = bytearray(136)
+        try:
+            fcntl.ioctl(fd, VIDIOC_DQEVENT, ev)
+        except OSError:
+            return count
+        # The payload union starts at offset 8, after `type` and its padding.
+        if struct.unpack_from("I", ev, 0)[0] == V4L2_EVENT_PRI_CLIENT_USAGE:
+            count = struct.unpack_from("I", ev, 8)[0]
+
+
+def _terminate(signum, frame):
+    """Turn a signal into an exception so the streaming teardown still runs.
+
+    systemd sends SIGTERM on stop and restart. Dying on the default handler
+    skips the `finally` that issues STREAMOFF, which leaves the sensor
+    streaming -- and therefore the IR illuminator lit -- until the next boot.
+    """
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def main():
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
+
+    loopback = find_loopback(LOOPBACK_LABEL)
+    if not loopback:
+        sys.exit(f"no v4l2loopback device labelled {LOOPBACK_LABEL!r}")
+    subdev, entity = find_subdev("ov7251")
+    if not subdev:
+        sys.exit("ov7251 has no v4l2 subdev -- driver did not bind")
+    node, csi = setup_graph(entity)
+    print(f"{entity} ({subdev}) via {csi} -> {node} -> {loopback}", flush=True)
+
+    out_fd = os.open(loopback, os.O_RDWR)
+    s_fmt(out_fd, BUF_TYPE_OUTPUT, FMT_YUYV, IR_W, IR_H)
+
+    # v4l2loopback only starts advertising CAPTURE to other openers once a
+    # producer has actually written something, so push one black frame now.
+    # Otherwise nothing could ever open the device and the client-usage event
+    # this loop waits for would never fire.
+    os.write(out_fd, bytes(IR_W * IR_H * 2))
+
+    sub = bytearray(32)
+    struct.pack_into("I", sub, 0, V4L2_EVENT_PRI_CLIENT_USAGE)
+    fcntl.ioctl(out_fd, VIDIOC_SUBSCRIBE_EVENT, sub)
+
+    try:
+        serve(entity, subdev, out_fd)
+    except KeyboardInterrupt as exc:
+        print(f"stopping: {exc}", flush=True)
+
+
+def serve(entity, subdev, out_fd):
+    while True:
+        select.select([], [], [out_fd])
+        if poll_client_count(out_fd):
+            print("client opened, streaming (IR illuminator on)", flush=True)
+            try:
+                run_session(entity, subdev, out_fd)
+            except (OSError, RuntimeError) as exc:
+                # Usually ENOLINK: a libcamera relay reconfigured the media
+                # device underneath us. Give up on this session, keep serving,
+                # but back off -- the client is still holding the loopback, so
+                # retrying immediately just spins.
+                if DEBUG:
+                    import traceback; traceback.print_exc()
+                print(f"session failed: {exc}", flush=True)
+                time.sleep(2)
+            print("idle", flush=True)
+
+
+if __name__ == "__main__":
+    main()

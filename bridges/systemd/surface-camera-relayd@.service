@@ -1,0 +1,13 @@
+[Unit]
+Description=Surface %i camera relay (libcamera -> v4l2loopback)
+Requires=surface-camera-loopbacks.service
+After=surface-camera-loopbacks.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/surface-camera-relayd %i
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

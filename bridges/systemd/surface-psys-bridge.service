@@ -1,0 +1,23 @@
+[Unit]
+Description=Surface front camera bridge (IPU6 hardware ISP -> v4l2loopback)
+Requires=surface-camera-loopbacks.service
+After=surface-camera-loopbacks.service
+# La frontal es de este puente; el relayd softISP de la frontal no debe
+# arrancar a la vez (dos productores sobre /dev/video80).
+Conflicts=surface-camera-relayd@front.service
+
+[Service]
+Type=simple
+Environment=PSYS_BRIDGE_DEBUG=
+ExecStart=/usr/local/bin/surface-psys-bridge
+Restart=always
+RestartSec=2
+# SIGTERM solo al daemon: el hijo gst-launch (icamerasrc) NUNCA debe recibir
+# TERM/KILL con frames fluyendo (atasca el firmware ISYS hasta reiniciar);
+# el daemon lo para con SIGINT y espera. El presupuesto de parada del daemon
+# es de 20 s, deja margen antes del KILL final.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

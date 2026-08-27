@@ -1,0 +1,14 @@
+diff --git a/src/v4l2-relayd.c b/src/v4l2-relayd.c
+index a3b1a1d..9c3d1f2 100644
+--- a/src/v4l2-relayd.c
++++ b/src/v4l2-relayd.c
+@@ -28,7 +28,8 @@
+ #include <gst/app/gstappsrc.h>
+ #include <gst/video/video-info.h>
+ 
+-#define V4L2_EVENT_PRI_CLIENT_USAGE  V4L2_EVENT_PRIVATE_START
++#define V4L2LOOPBACK_EVENT_OFFSET    0x08E00000
++#define V4L2_EVENT_PRI_CLIENT_USAGE  (V4L2_EVENT_PRIVATE_START + V4L2LOOPBACK_EVENT_OFFSET + 1)
+ 
+ struct v4l2_event_client_usage {
+   __u32 count;

@@ -1,0 +1,14 @@
+[Unit]
+Description=Surface IR camera bridge (OV7251 -> v4l2loopback)
+Requires=surface-camera-loopbacks.service
+After=surface-camera-loopbacks.service
+
+[Service]
+Type=simple
+Environment=IR_BRIDGE_DEBUG=
+ExecStart=/usr/local/bin/surface-ir-bridge
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Create v4l2loopback devices for the Surface cameras
+After=systemd-modules-load.service
+Before=v4l2-relayd.service surface-ir-bridge.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/surface-camera-loopbacks
+
+[Install]
+WantedBy=multi-user.target

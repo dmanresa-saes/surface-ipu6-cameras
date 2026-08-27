@@ -1,0 +1,2 @@
+# Allow the video group to use the system DMA heap (libcamera software ISP)
+SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="video", MODE="0660"
