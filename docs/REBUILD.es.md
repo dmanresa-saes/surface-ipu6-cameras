@@ -1,9 +1,3 @@
-> **Note (EN):** This is the full rebuild playbook, currently in Spanish.
-> It is the canonical, self-contained document: every patch, script and
-> calibration in this repository is embedded here in the order it must be
-> applied, together with the known traps. The top-level README covers the
-> highlights in English.
-
 # REPRODUCIR.md — Cámaras Surface Pro 7+ en Linux, de cero
 > **Para quien lee esto (humano o IA):** este fichero es la única fuente necesaria
 > para dejar funcionando las cámaras de un Surface Pro 7+ (front OV5693, trasera
@@ -454,15 +448,26 @@ queda sustituido por el de /updates.
 ```
 
 **int3472** (el glue ACPI de alimentación de los sensores): parche necesario
-para que la trasera OV8865 reciba sus reguladores. Trampa descubierta:
-`GPIO_SUPPLY_NAME_LENGTH` = 5 (4 chars máx): "dovdd" NO cabe, por eso el
-OV8865 mapea a "dvdd". El int3472 solo enumera su sensor EN EL ARRANQUE:
+para que la trasera OV8865 y la IR OV7251 reciban sus reguladores. El enfoque
+para la OV8865 es ahora el del parche upstream de Jakob Berg Jespersen
+"[PATCH v2] platform/x86: int3472: support the POWER1 GPIO type"
+(msgid `20260729-sp7plus-int3472-v2-1-cdfaf97ac3ad@berg.pm`, enviado a
+platform-driver-x86, Suggested-by: Sakari Ailus): define los tipos de GPIO
+POWER0 (0x07) y POWER1 (0x08) y mapea POWER1 a un regulador con con_id
+"dvdd" GENÉRICAMENTE (sin quirk por HID); es lo que previsiblemente acabará
+en mainline. Encima conservamos NUESTRA parte para la IR (INT347E →
+power-enable con con_id "vdda"), que su parche no cubre, y el parámetro de
+módulo `ov8865_pwr1_con_id` como override opcional del con_id de POWER1
+(default "dvdd", compatible con lo documentado antes). Trampa descubierta:
+`GPIO_SUPPLY_NAME_LENGTH` = 5 (4 chars máx): "dovdd" NO cabe, por eso
+POWER1 mapea a "dvdd". El int3472 solo enumera su sensor EN EL ARRANQUE:
 cada prueba = reiniciar. Diff vs mainline v6.19
-(drivers/platform/x86/intel/int3472/):
+(drivers/platform/x86/intel/int3472/; también en
+publish/surface-ipu6-cameras/patches/int3472-surface-sensors.patch):
 
 ```diff
---- /tmp/claude-1000/int3472-ml/discrete.c	2026-08-27 00:06:14.808235835 +0200
-+++ discrete.c	2026-08-25 21:18:49.265727806 +0200
+--- a/drivers/platform/x86/intel/int3472/discrete.c
++++ b/drivers/platform/x86/intel/int3472/discrete.c
 @@ -157,6 +157,20 @@
  		.type_to = INT3472_GPIO_TYPE_RESET,
  		.con_id = "enable",
@@ -484,41 +489,83 @@ cada prueba = reiniciar. Diff vs mainline v6.19
  	{	/* ov08x40's handshake pin needs a 45 ms delay on some HP laptops */
  		.hid = "OVTI08F4",
  		.type_from = INT3472_GPIO_TYPE_HANDSHAKE,
-@@ -166,6 +180,19 @@
+@@ -166,6 +180,40 @@
  	},
  };
  
 +/*
-+ * Surface Pro 7+ declares a second power-enable GPIO for the OV8865 with the
-+ * vendor-specific type 0x08, which no upstream code handles. The sensor needs
-+ * it: with only the type 0x0B rail ("avdd") powered the first I2C write dies
-+ * with -121. Which of the ov8865 driver's supplies it actually feeds is a
-+ * guess, so keep it settable. Note that GPIO_SUPPLY_NAME_LENGTH is 5, so
-+ * "dovdd" -- the other candidate -- does not even fit.
++ * POWER0 (0x07) / POWER1 (0x08) GPIO types. Not yet defined in the v6.19
++ * header (include/linux/platform_data/x86/int3472.h); POWER1 describes a
++ * second sensor power rail, mapped generically to a regulator with con_id
++ * "dvdd" (the supply the in-tree ov8865 driver requests). On the Surface
++ * Pro 7+ the rear camera's INT3472 (INT347A, ov8865) has such a pin;
++ * without it "dvdd" resolves to a dummy regulator, the first I2C write
++ * dies with -121 and the sensor never probes. POWER0 is defined but left
++ * unmapped, as no device that uses it is known.
++ *
++ * Based on Jakob Berg Jespersen's upstream patch
++ * "[PATCH v2] platform/x86: int3472: support the POWER1 GPIO type"
++ * <20260729-sp7plus-int3472-v2-1-cdfaf97ac3ad@berg.pm>
++ * (Suggested-by: Sakari Ailus).
++ */
++#ifndef INT3472_GPIO_TYPE_POWER0
++#define INT3472_GPIO_TYPE_POWER0				0x07
++#endif
++#ifndef INT3472_GPIO_TYPE_POWER1
++#define INT3472_GPIO_TYPE_POWER1				0x08
++#endif
++
++/*
++ * Optional override kept for compatibility with earlier revisions of this
++ * DKMS package, which mapped the OV8865's POWER1 pin per-HID with a
++ * settable supply name. The default follows Jespersen's generic mapping
++ * ("dvdd"). Note that GPIO_SUPPLY_NAME_LENGTH is 5, so "dovdd" -- the
++ * other candidate -- does not even fit.
 + */
 +static char *ov8865_pwr1_con_id = "dvdd";
 +module_param(ov8865_pwr1_con_id, charp, 0644);
 +MODULE_PARM_DESC(ov8865_pwr1_con_id,
-+		 "supply name for the OV8865's type 0x08 power-enable GPIO");
++		 "supply name for the POWER1 (type 0x08) GPIO regulator (default: dvdd)");
 +
  static void int3472_get_con_id_and_polarity(struct int3472_discrete_device *int3472, u8 *type,
  					    const char **con_id, unsigned long *gpio_flags,
  					    unsigned int *enable_time_us)
-@@ -173,6 +200,14 @@
- 	struct acpi_device *adev = int3472->sensor;
- 	unsigned int i;
- 
-+	if (*type == 0x08 && acpi_dev_hid_uid_match(adev, "INT347A", NULL)) {
-+		*type = INT3472_GPIO_TYPE_POWER_ENABLE;
+@@ -223,6 +271,10 @@
+ 		*con_id = "avdd";
+ 		*gpio_flags = GPIO_ACTIVE_HIGH;
+ 		break;
++	case INT3472_GPIO_TYPE_POWER1:
 +		*con_id = ov8865_pwr1_con_id;
 +		*gpio_flags = GPIO_ACTIVE_HIGH;
-+		*enable_time_us = GPIO_REGULATOR_ENABLE_TIME;
-+		return;
-+	}
-+
- 	for (i = 0; i < ARRAY_SIZE(int3472_gpio_map); i++) {
- 		/*
- 		 * Map the firmware-provided GPIO to whatever a driver expects
++		break;
+ 	case INT3472_GPIO_TYPE_HANDSHAKE:
+ 		*con_id = "dvdd";
+ 		*gpio_flags = GPIO_ACTIVE_HIGH;
+@@ -248,6 +300,8 @@
+  *
+  * 0x00 Reset
+  * 0x01 Power down
++ * 0x07 Power 0
++ * 0x08 Power 1
+  * 0x0b Power enable
+  * 0x0c Clock enable
+  * 0x0d Privacy LED
+@@ -332,6 +386,7 @@
+ 	case INT3472_GPIO_TYPE_CLK_ENABLE:
+ 	case INT3472_GPIO_TYPE_PRIVACY_LED:
+ 	case INT3472_GPIO_TYPE_POWER_ENABLE:
++	case INT3472_GPIO_TYPE_POWER1:
+ 	case INT3472_GPIO_TYPE_HANDSHAKE:
+ 		gpio = skl_int3472_gpiod_get_from_temp_lookup(int3472, agpio, con_id, gpio_flags);
+ 		if (IS_ERR(gpio)) {
+@@ -356,6 +411,7 @@
+ 		case INT3472_GPIO_TYPE_POWER_ENABLE:
+ 			second_sensor = int3472->quirks.avdd_second_sensor;
+ 			fallthrough;
++		case INT3472_GPIO_TYPE_POWER1:
+ 		case INT3472_GPIO_TYPE_HANDSHAKE:
+ 			ret = skl_int3472_register_regulator(int3472, gpio, enable_time_us,
+ 							     con_id, second_sensor);
 ```
 
 El OV8865 usa el driver mainline SIN tocar.
@@ -664,7 +711,13 @@ Detalles del softISP que condicionan todo (aprendidos a golpes):
   el TAMAÑO pedido: pedir <=1292 de ancho → modo binned 1296 (el debayer roba
   un borde de 2px por lado).
 - El softISP a 1920 de ancho mete una columna oscura en x=1211 (bug
-  determinista); renderizar la trasera a 1600x900 lo evita.
+  determinista). El mismo resampler GPU mete FILAS magenta de 1px en
+  posiciones que dependen del ANCHO del render (1600 → filas 371 y 771;
+  1568 → 483 y 875; independientes de la altura); con el CCM calibrado se
+  ven rojas. A 1596 de ancho no hay ninguna → la trasera renderiza
+  1596x896. Además la fila 0 y la columna 0 del debayer salen magenta
+  (fase Bayer incompleta): se recortan 2px por lado con videocrop
+  (post-debayer, no afecta a la calibración).
 - AWB bayes exige en el yaml: colourGains {ct,gains}, priors, y AwbMode como
   DICCIONARIO (clave = nombre del control, singular) incluyendo AwbAuto.
 
@@ -826,6 +879,57 @@ algorithms:
 5. Variación módulo a módulo real: ~9% (esta unidad necesitó r x1.20 b x1.08
    netos sobre las cromaticidades OEM).
 
+### 6.1 El tuning de color de la trasera (ov8865.yaml) — CALIBRADO 2026-08-28
+
+Instalar `tuning/libcamera/ov8865.yaml` en
+`/usr/local/share/libcamera/ipa/softisp/ov8865.yaml` (fuente = copia
+autoritativa; la cabecera del fichero documenta procedencia y estado).
+Curva AWB bayes + CCMs del OEM `OV8865_MSHW0221_TGL.aiqb` (sección 9),
+CCMs x1.28 como la frontal.
+
+**Anclaje final: r x1.07 / b x1.083 netos** sobre las ganancias OEM (misma
+banda de variación módulo a módulo que la frontal, x1.20/x1.08). Medido en
+zona neutra del render (pared/colcha blancas, ~70% del encuadre, LED ~4600K
+estable): OEM puro daba R/G 0.959 / B/G 0.954; final **R/G 1.002, B/G 1.008**
+(criterio 1.00±0.03), AWB clavado en 4605±2K durante 11 s (gains 1.93/1.83
+variando en la 4ª decimal). Convergió en 3 iteraciones con luz estable
+(1.05/1.06 → 0.979/0.980; 1.09/1.11 → 1.020/1.024; interpolando → final).
+
+**El bug que había que arreglar NO era el anclaje sino el black level.** El
+OV8865 es tan poco sensible (ver abajo) que el raw típico queda al 2-5% del
+fondo de escala INCLUSO con AGC a tope; el pedestal (16/1023, coincide con el
+64/4095 que calibra su .aiqb) es entonces comparable a la señal:
+- el default del softISP asume black level 16/**255** (4x el real), y
+- el auto-ajuste por histograma tiene granularidad 4/255 = 16/1023, con lo
+  que aquí cae a 0 (bin 0),
+y en ambos casos el AWB calcula R/G y B/G con pedestal dentro → ratios ~0.9
+(falso neutro), el bayes elige ~4600K y el render sale MAGENTA (fue el
+síntoma inicial). Fix en el yaml: `BlackLevel: { blackLevel: 1024 }` (clave
+de 16 bits, el softISP usa valor>>8 → nivel 4/255 = 16/1023 exacto).
+
+Trampas nuevas de esta calibración (además de las de la frontal):
+- El CCM OEM de la trasera amplifica ~3x los errores de azul en el render
+  (fila B = [-0.09, -1.93, +3.02]): un 5% de déficit de azul post-AWB sale
+  como ~15% en el render. Con el deslizamiento del fit por la curva, cada
+  cambio nominal de b materializa solo ~1/4-1/2.
+- Calibrar SOLO con iluminante estable: una primera pasada al atardecer,
+  con la componente de luz de día muriendo, medía residuos que perseguían la
+  deriva (CT aparente 4000→6300K en 10 min), no el módulo — llegó a "pedir"
+  b x1.5. Descartada entera; con el LED de techo estable convergió en 3
+  iteraciones a r x1.07 / b x1.083.
+- Con el canal B a <1 LSB neto las stats son ruido rectificado y el fit se
+  vuelve caos (Means Vector saltando, B clavado en 1e-05): NO iterar así.
+
+**Sensibilidad (limitación, no bug de color)**: el modo 1632x1224 corre a
+~120 fps (VTS 1246, línea 6,68 µs, pixel rate 288 MHz) → exposición máx
+8,3 ms, y la ganancia analógica solo llega a x16. Verificado por raw directo:
+subir `vertical_blanking` a 2500 (VTS 3724, ~40 fps) hace que el driver
+amplíe la exposición a 3716 líneas (24,8 ms) y da x3 de señal (raw real,
+probado con camtest.sh + v4l2-ctl), pero el pipeline softISP no lo digiere
+bien (stats a ~2,5 fps, AGC sin converger en 10 s) y vblank=3769 (33 ms)
+directamente rompe el sensor (frames planos). Queda como pendiente (sección
+11); el tuning de color es independiente de esto.
+
 ## 7. El puente: scripts y unidades systemd
 
 `/usr/local/bin/surface-camera-loopbacks`:
@@ -905,12 +1009,20 @@ else
     # Render larger than the output: the software ISP emits black frames when
     # asked for less than ~1296 px wide from a full-resolution readout.
     #
-    # 1600x900 rather than the obvious 1920x1080: at exactly 1920 wide the
+    # 1596x896 rather than the obvious 1920x1080: at exactly 1920 wide the
     # software ISP lays a dark column down 63% of the frame -- reproducible to
     # the same pixel (x=1211), about 23% below its neighbours, and absent from
-    # the raw Bayer. At 1600x900 the worst column is 1.5% off and lands
-    # somewhere different every run, which is just noise.
-    INPUT+=" ! video/x-raw,width=1600,height=900"
+    # the raw Bayer. The same GPU resampler also lays 1-px magenta ROWS at
+    # width-dependent positions (1600 wide -> rows 371 and 771, 1568 wide ->
+    # rows 483 and 875, regardless of height); with the calibrated CCM they
+    # glow red. At 1596 wide there are none: the worst interior row/column is
+    # <1% off and lands somewhere different every frame, which is just noise.
+    INPUT+=" ! video/x-raw,width=1596,height=896"
+    # The debayer's first row and first column carry an incomplete Bayer
+    # phase and come out magenta (~+60 R-G vs neighbours after the CCM).
+    # Crop 2 px all round (post-debayer RGB, so the Bayer phase and the
+    # colour calibration are untouched) before scaling.
+    INPUT+=" ! videocrop top=2 left=2 right=2 bottom=2"
     # skip-to-first: v4l2-relayd keeps one clock for the splash and the
     # camera, so by the time a client shows up the pipeline's running time is
     # however long the daemon has been idle. Without this, videorate treats
@@ -952,7 +1064,9 @@ Claves no obvias de ese script:
 - `v4l2sink sync=false`: los timestamps de libcamerasrc van en reloj de sensor;
   con sync=true el appsrc estrangula a ~1fps.
 - Front pide 1280x720 directo (fuerza modo binned, ver sección 5); rear
-  renderiza 1600x900 y escala (evita la columna oscura de 1920).
+  renderiza 1596x896, recorta 2px por lado (bordes magenta del debayer) y
+  escala (1596 de ancho evita la columna oscura de 1920 y las filas magenta
+  interiores de 1600/1568).
 
 `/usr/local/bin/surface-ir-bridge` (completo, python):
 ```python
@@ -2319,8 +2433,12 @@ ver 10.x/notas). Vías futuras NO acotadas: (a) descifrar el record AE nid
 
 ## 11. Pendientes conocidos
 
-- Calibrar color de la trasera (ov8865.yaml: mismo método, datos OEM ya
-  decodificables, sección 9).
+- (HECHO 2026-08-28) Calibrar color de la trasera (sección 6.1: curva OEM
+  anclada r x1.07 / b x1.083 + blackLevel 16/1023 explícito).
+- Trasera más brillante: subir vertical_blanking (2500 → 24,8 ms de
+  exposición, x3 de señal verificado en raw) requiere que el softISP/AGC lo
+  digiera; hoy desestabiliza el pipeline (ver sección 6.1). Alternativa: el
+  camino PSYS de abajo.
 - IR más brillante: portar PLL (30b0-30b5, 3098-309b) y VTS (522 vs 1724) del
   ov7251.sys de Windows.
 - Publicar todo en GitHub (borradores primero; cuenta dmanresa-saes).

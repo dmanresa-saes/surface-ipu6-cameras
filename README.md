@@ -12,7 +12,7 @@ the silicon orphaned.
 |---|---|---|---|
 | front | OV5693 | **hardware ISP (IPU6 PSYS)**: 1280x720@30 from the 2x2-binned sensor mode, OEM `.aiqb` tuning in Intel's HAL, ~7% CPU | `/dev/video80` — "Surface Front Camera" |
 | IR (Windows Hello) | OV7251 | working, IR illuminator driven with the stream | `/dev/video81` — "Surface IR Camera" |
-| rear | OV8865 | working via libcamera softISP (colour not yet calibrated) | `/dev/video82` — "Surface Rear Camera" |
+| rear | OV8865 | working via libcamera softISP, colour calibrated from the OEM tuning | `/dev/video82` — "Surface Rear Camera" |
 
 All three appear in Chrome and any V4L2 app as ordinary webcams, start when
 an application opens the device and stop when it closes — which matters
@@ -47,8 +47,11 @@ are English or trivially readable). The short version:
    `ipu6-camera-hal` (with [`patches/ipu6-camera-hal-bggr-support.patch`](patches/ipu6-camera-hal-bggr-support.patch))
    and `icamerasrc`; for the rear camera, libcamera with
    [`patches/libcamera-local.patch`](patches/libcamera-local.patch) and the
-   tuning file in [`config/tuning/libcamera/ov5693.yaml`](config/tuning/libcamera/ov5693.yaml);
-   patched `v4l2-relayd`.
+   tuning file in [`config/tuning/libcamera/ov8865.yaml`](config/tuning/libcamera/ov8865.yaml)
+   (the front's softISP tuning, [`ov5693.yaml`](config/tuning/libcamera/ov5693.yaml),
+   is also included for reference); patched `v4l2-relayd`. Note the rear
+   tuning sets an explicit 16-bit `blackLevel: 1024` — the softISP default
+   swallows the pedestal on this short-exposure sensor and renders magenta.
 4. **OEM tuning files** (not redistributable — extract them yourself):
    Microsoft ships the Intel colour calibration of all three cameras inside
    the public Surface Pro 7+ driver MSI:
@@ -161,9 +164,14 @@ frame ~0.3 s after a client opens the device when the start is good).
 
 - `GPIO_SUPPLY_NAME_LENGTH` in `int3472` is **5** (4 chars + NUL), so
   `dovdd` — a standard OmniVision supply name — literally cannot be mapped.
-  The rear camera's second power rail also arrives as vendor-specific GPIO
-  type `0x08`, which upstream ignores entirely; without it the sensor never
-  powers on (probe dies with -121).
+  The rear camera's second power rail also arrives as GPIO type `0x08`
+  (POWER1), which released kernels ignore; without it the sensor never
+  powers on (probe dies with -121). Our patch now follows Jakob Berg
+  Jespersen's upstream fix for this
+  ("[PATCH v2] platform/x86: int3472: support the POWER1 GPIO type",
+  msgid `20260729-sp7plus-int3472-v2-1-cdfaf97ac3ad@berg.pm`), which maps
+  POWER1 to a `dvdd` regulator generically, plus our INT347E → `vdda`
+  mapping for the IR camera, which that patch does not cover.
 - `ipu_bridge` leaks its software nodes on driver unbind: after a PCI
   remove/rescan of the IPU6 they linger in `/sys/kernel/software_nodes/`
   pointing into unloaded module rodata, and re-probe fails with `-EEXIST`.

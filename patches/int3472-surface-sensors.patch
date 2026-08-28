@@ -21,38 +21,80 @@
  	{	/* ov08x40's handshake pin needs a 45 ms delay on some HP laptops */
  		.hid = "OVTI08F4",
  		.type_from = INT3472_GPIO_TYPE_HANDSHAKE,
-@@ -166,6 +180,19 @@
+@@ -166,6 +180,40 @@
  	},
  };
  
 +/*
-+ * Surface Pro 7+ declares a second power-enable GPIO for the OV8865 with the
-+ * vendor-specific type 0x08, which no upstream code handles. The sensor needs
-+ * it: with only the type 0x0B rail ("avdd") powered the first I2C write dies
-+ * with -121. Which of the ov8865 driver's supplies it actually feeds is a
-+ * guess, so keep it settable. Note that GPIO_SUPPLY_NAME_LENGTH is 5, so
-+ * "dovdd" -- the other candidate -- does not even fit.
++ * POWER0 (0x07) / POWER1 (0x08) GPIO types. Not yet defined in the v6.19
++ * header (include/linux/platform_data/x86/int3472.h); POWER1 describes a
++ * second sensor power rail, mapped generically to a regulator with con_id
++ * "dvdd" (the supply the in-tree ov8865 driver requests). On the Surface
++ * Pro 7+ the rear camera's INT3472 (INT347A, ov8865) has such a pin;
++ * without it "dvdd" resolves to a dummy regulator, the first I2C write
++ * dies with -121 and the sensor never probes. POWER0 is defined but left
++ * unmapped, as no device that uses it is known.
++ *
++ * Based on Jakob Berg Jespersen's upstream patch
++ * "[PATCH v2] platform/x86: int3472: support the POWER1 GPIO type"
++ * <20260729-sp7plus-int3472-v2-1-cdfaf97ac3ad@berg.pm>
++ * (Suggested-by: Sakari Ailus).
++ */
++#ifndef INT3472_GPIO_TYPE_POWER0
++#define INT3472_GPIO_TYPE_POWER0				0x07
++#endif
++#ifndef INT3472_GPIO_TYPE_POWER1
++#define INT3472_GPIO_TYPE_POWER1				0x08
++#endif
++
++/*
++ * Optional override kept for compatibility with earlier revisions of this
++ * DKMS package, which mapped the OV8865's POWER1 pin per-HID with a
++ * settable supply name. The default follows Jespersen's generic mapping
++ * ("dvdd"). Note that GPIO_SUPPLY_NAME_LENGTH is 5, so "dovdd" -- the
++ * other candidate -- does not even fit.
 + */
 +static char *ov8865_pwr1_con_id = "dvdd";
 +module_param(ov8865_pwr1_con_id, charp, 0644);
 +MODULE_PARM_DESC(ov8865_pwr1_con_id,
-+		 "supply name for the OV8865's type 0x08 power-enable GPIO");
++		 "supply name for the POWER1 (type 0x08) GPIO regulator (default: dvdd)");
 +
  static void int3472_get_con_id_and_polarity(struct int3472_discrete_device *int3472, u8 *type,
  					    const char **con_id, unsigned long *gpio_flags,
  					    unsigned int *enable_time_us)
-@@ -173,6 +200,14 @@
- 	struct acpi_device *adev = int3472->sensor;
- 	unsigned int i;
- 
-+	if (*type == 0x08 && acpi_dev_hid_uid_match(adev, "INT347A", NULL)) {
-+		*type = INT3472_GPIO_TYPE_POWER_ENABLE;
+@@ -223,6 +271,10 @@
+ 		*con_id = "avdd";
+ 		*gpio_flags = GPIO_ACTIVE_HIGH;
+ 		break;
++	case INT3472_GPIO_TYPE_POWER1:
 +		*con_id = ov8865_pwr1_con_id;
 +		*gpio_flags = GPIO_ACTIVE_HIGH;
-+		*enable_time_us = GPIO_REGULATOR_ENABLE_TIME;
-+		return;
-+	}
-+
- 	for (i = 0; i < ARRAY_SIZE(int3472_gpio_map); i++) {
- 		/*
- 		 * Map the firmware-provided GPIO to whatever a driver expects
++		break;
+ 	case INT3472_GPIO_TYPE_HANDSHAKE:
+ 		*con_id = "dvdd";
+ 		*gpio_flags = GPIO_ACTIVE_HIGH;
+@@ -248,6 +300,8 @@
+  *
+  * 0x00 Reset
+  * 0x01 Power down
++ * 0x07 Power 0
++ * 0x08 Power 1
+  * 0x0b Power enable
+  * 0x0c Clock enable
+  * 0x0d Privacy LED
+@@ -332,6 +386,7 @@
+ 	case INT3472_GPIO_TYPE_CLK_ENABLE:
+ 	case INT3472_GPIO_TYPE_PRIVACY_LED:
+ 	case INT3472_GPIO_TYPE_POWER_ENABLE:
++	case INT3472_GPIO_TYPE_POWER1:
+ 	case INT3472_GPIO_TYPE_HANDSHAKE:
+ 		gpio = skl_int3472_gpiod_get_from_temp_lookup(int3472, agpio, con_id, gpio_flags);
+ 		if (IS_ERR(gpio)) {
+@@ -356,6 +411,7 @@
+ 		case INT3472_GPIO_TYPE_POWER_ENABLE:
+ 			second_sensor = int3472->quirks.avdd_second_sensor;
+ 			fallthrough;
++		case INT3472_GPIO_TYPE_POWER1:
+ 		case INT3472_GPIO_TYPE_HANDSHAKE:
+ 			ret = skl_int3472_register_regulator(int3472, gpio, enable_time_us,
+ 							     con_id, second_sensor);

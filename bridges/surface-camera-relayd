@@ -49,12 +49,20 @@ else
     # Render larger than the output: the software ISP emits black frames when
     # asked for less than ~1296 px wide from a full-resolution readout.
     #
-    # 1600x900 rather than the obvious 1920x1080: at exactly 1920 wide the
+    # 1596x896 rather than the obvious 1920x1080: at exactly 1920 wide the
     # software ISP lays a dark column down 63% of the frame -- reproducible to
     # the same pixel (x=1211), about 23% below its neighbours, and absent from
-    # the raw Bayer. At 1600x900 the worst column is 1.5% off and lands
-    # somewhere different every run, which is just noise.
-    INPUT+=" ! video/x-raw,width=1600,height=900"
+    # the raw Bayer. The same GPU resampler also lays 1-px magenta ROWS at
+    # width-dependent positions (1600 wide -> rows 371 and 771, 1568 wide ->
+    # rows 483 and 875, regardless of height); with the calibrated CCM they
+    # glow red. At 1596 wide there are none: the worst interior row/column is
+    # <1% off and lands somewhere different every frame, which is just noise.
+    INPUT+=" ! video/x-raw,width=1596,height=896"
+    # The debayer's first row and first column carry an incomplete Bayer
+    # phase and come out magenta (~+60 R-G vs neighbours after the CCM).
+    # Crop 2 px all round (post-debayer RGB, so the Bayer phase and the
+    # colour calibration are untouched) before scaling.
+    INPUT+=" ! videocrop top=2 left=2 right=2 bottom=2"
     # skip-to-first: v4l2-relayd keeps one clock for the splash and the
     # camera, so by the time a client shows up the pipeline's running time is
     # however long the daemon has been idle. Without this, videorate treats

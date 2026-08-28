@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# Colour tuning for the OV8865 (rear camera) as wired on the Surface Pro 7+.
+#
+# ESTADO: CALIBRADO (2026-08-28). Curva AWB y CCMs decodificadas del
+# tuning OEM de Microsoft (OV8865_MSHW0221_TGL.aiqb, ver
+# w11-ref/aiqb-real/decode_aiqb.py); CCMs reforzadas x1.28 como en la frontal
+# (preferencia de saturacion del pipeline de Windows). Anclaje a la unidad
+# fisica: r x1.07 / b x1.083 netos sobre las ganancias OEM (misma zona de
+# variacion modulo a modulo que la frontal, que quedo en r x1.20 / b x1.08).
+# Verificado: zona neutra del render R/G 1.002 / B/G 1.008, AWB clavado en
+# 4605+-2K durante 11 s bajo LED ~4600K real. La otra pieza imprescindible
+# es el blackLevel explicito (ver abajo): sin el, el AWB de este sensor tan
+# poco sensible traga pedestal y el render sale magenta.
+# Metodo de anclaje: REPRODUCIR.md seccion 6 (stats del softISP via
+# LIBCAMERA_LOG_LEVELS=Awb:DEBUG, linea "Means Vector", zona neutra R/G y B/G
+# a 1.00+-0.03; el fit bayes materializa ~la mitad de cada cambio nominal).
+#
+# Punto blanco OEM por iluminante (rpg=R/G, bpg=B/G del sensor; gains=1/x):
+#   F12        2676K  rpg 0.7874  bpg 0.3642
+#   A          2726K  rpg 0.8032  bpg 0.4060
+#   F11/TL84   3953K  rpg 0.5257  bpg 0.4481
+#   D50        4604K  rpg 0.5284  bpg 0.5725
+#   D65        6267K  rpg 0.4536  bpg 0.6787
+#   D75        6964K  rpg 0.4562  bpg 0.7312
+%YAML 1.1
+---
+version: 1
+algorithms:
+  # blackLevel es de 16 bits (el softISP usa valor>>8): 1024 -> nivel 4/255 =
+  # 16/1023, el pedestal real del OV8865 (medido en raw a tope de exposicion:
+  # suelo en ~15.5-16/1023 en los tres canales). IMPRESCINDIBLE fijarlo: el
+  # default del softISP es 16/255 (4x el pedestal real) y el auto-ajuste por
+  # histograma tiene granularidad de 4/255, con lo que cae a 0 y el AWB
+  # calcula sus ratios con el pedestal incluido. Con la senal tan baja de
+  # este modulo (raw tipico a 2-5% del fondo de escala incluso a exposicion y
+  # ganancia maximas) el pedestal domina y los ratios salen ~0.9/0.85 (falso
+  # neutro) -> render magenta. Restando 16/1023 los ratios son los de la
+  # escena real.
+  - BlackLevel:
+      blackLevel: 1024
+  # Bayesian AWB (mismo esquema que la frontal): colourGains = reciprocos del
+  # punto blanco OEM por iluminante, CT del CIE xy del record (McCamy).
+  - Awb:
+      algorithm: bayes
+      # Anclaje a la unidad fisica: NETO r x1.07 / b x1.083 sobre las
+      # ganancias OEM. Iterado 2026-08-28 contra zona neutra del render
+      # (pared y colcha blancas, LED ~4600K estable): OEM puro dio
+      # R/G 0.959 / B/G 0.954; final R/G 1.002 / B/G 1.008 (criterio
+      # 1.00+-0.03), fit 4605+-2K sin oscilar en 11 s.
+      # OJO al iterar: (1) SOLO con iluminante estable — una sesion previa al
+      # atardecer perseguia la deriva de la luz, no el modulo; (2) el fit
+      # bayes se DESLIZA por la curva al reescalarla y materializa ~la mitad
+      # de cada cambio nominal; (3) el CCM OEM amplifica ~3x los errores de
+      # azul en el render (fila B = [-0.09, -1.93, +3.02]).
+      colourGains:
+        - ct: 2676
+          gains: [ 1.359, 2.974 ]
+        - ct: 2726
+          gains: [ 1.332, 2.667 ]
+        - ct: 3953
+          gains: [ 2.035, 2.417 ]
+        - ct: 4604
+          gains: [ 2.024, 1.892 ]
+        - ct: 6267
+          gains: [ 2.358, 1.596 ]
+        - ct: 6964
+          gains: [ 2.345, 1.482 ]
+      transversePos: 0.03
+      transverseNeg: 0.03
+      priors:
+        - lux: 0
+          ct: [ 2000, 13000 ]
+          probability: [ 1.0, 1.0 ]
+      # CT search ranges per V4L2 AWB mode; bayes refuses to start without
+      # them (the tuning key is the control name "AwbMode") and AwbAuto is
+      # the default the wrapper registers.
+      AwbMode:
+        AwbAuto:
+          lo: 2676
+          hi: 6964
+        AwbIncandescent:
+          lo: 2676
+          hi: 3000
+        AwbTungsten:
+          lo: 3000
+          hi: 3500
+        AwbFluorescent:
+          lo: 3900
+          hi: 4700
+        AwbDaylight:
+          lo: 5500
+          hi: 6500
+        AwbCloudy:
+          lo: 6800
+          hi: 6964
+  # CCMs: matrices 'traditional' OEM del mismo record, reforzadas x1.28
+  # (M' = K*M + (1-K)*I, filas siguen sumando 1), igual que la frontal.
+  - Ccm:
+      ccms:
+        - ct: 2676
+          ccm: [  2.1313, -0.9674, -0.1638,
+                 -0.6472,  2.0531, -0.4059,
+                 -0.0925, -1.9320,  3.0244 ]
+        - ct: 2726
+          ccm: [  1.9800, -0.7937, -0.1862,
+                 -0.5928,  2.0243, -0.4315,
+                 -0.0762, -1.8231,  2.8993 ]
+        - ct: 3953
+          ccm: [  2.9103, -1.7885, -0.1217,
+                 -0.4995,  1.7698, -0.2703,
+                 -0.0393, -1.0888,  2.1282 ]
+        - ct: 4604
+          ccm: [  2.0387, -0.7360, -0.3027,
+                 -0.4349,  2.0811, -0.6460,
+                 -0.0557, -1.0668,  2.1224 ]
+        - ct: 6267
+          ccm: [  2.1375, -0.9268, -0.2107,
+                 -0.3997,  2.1160, -0.7163,
+                 -0.0315, -0.8991,  1.9306 ]
+        - ct: 6964
+          ccm: [  2.0739, -0.9164, -0.1576,
+                 -0.3640,  1.9804, -0.6164,
+                 -0.0442, -0.7519,  1.7960 ]
+  - Adjust:
+  - Agc:
+      # MSV target (default 2.5 centres the histogram); same reasoning as the
+      # front camera: keep lit walls below clipping, clipped highlights poison
+      # the AWB statistics.
+      exposureOptimal: 2.1
