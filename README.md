@@ -99,6 +99,13 @@ Windows' `ov5693.sys` ([`tools/extract_tables.py`](tools/extract_tables.py)):
 - **vertical flip is mode-dependent**: in binned mode only the sensor-side
   flip bit of `0x3820` may be set — both bits at once corrupt the CSI-2
   framing, the ISP bit alone streams but doesn't flip;
+- since 2026-08-29 the patch is **rebased on the "media: i2c: Surface Pro
+  7+ camera flip fixes" v2 series** (patchwork linux-media series 28516),
+  which inverts the HFLIP polarity: the HAL profile uses `hflip=0` now (was
+  `hflip=1`), and in the binned mode the ISP window X offset stays at 8 in
+  both flip states, because — measured on hardware — the binned readout's
+  Bayer phase does not move with the mirror (a parity nudge there turns the
+  HFLIP=1 state magenta);
 - a 30 fps VTS cap (the binned PLL cannot carry the 60 fps VTS) and
   `MIPI_CTRL00 (0x4800) = 0x2d` at stream-on, without which the IPU6 D-PHY
   never locks (that last register is linux-surface PR
@@ -149,7 +156,7 @@ packages. What was missing:
 - a sensor profile for the HAL on the mainline media graph
   ([`config/ov5693-uf.xml`](config/ov5693-uf.xml), `mediaCfg=1`) and the
   orientation/Bayer-phase combination that satisfies both the sensor and the
-  firmware: `vflip=1 hflip=1` in the profile + `binned_y_offset=1` (odd =
+  firmware: `vflip=1 hflip=0` in the profile (hflip was 1 before the flip-fixes series inverted the HFLIP polarity) + `binned_y_offset=1` (odd =
   GRBG) in the driver.
 
 Result: sensor → ISYS → PSYS → NV12 at 30 fps, ~7% CPU, hardware denoise +

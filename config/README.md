@@ -2,7 +2,7 @@
 
 | file | installs to | what |
 |---|---|---|
-| `ov5693-uf.xml` | `/etc/camera/ipu6/sensors/ov5693-uf.xml` | HAL sensor profile for the front OV5693 on the **mainline** ISYS driver (`mediaCfg=1`), binned 1296x972 SBGGR10, NV12 out, `vflip=1 hflip=1` (matched with the driver's `binned_y_offset=1`). Own work, MIT. |
+| `ov5693-uf.xml` | `/etc/camera/ipu6/sensors/ov5693-uf.xml` | HAL sensor profile for the front OV5693 on the **mainline** ISYS driver (`mediaCfg=1`), binned 1296x972 SBGGR10, NV12 out, `vflip=1 hflip=0` — hflip=0 since the flip-fixes series inverted HFLIP polarity — (matched with the driver's `binned_y_offset=1`). Own work, MIT. |
 | `tuning/libcamera/ov5693.yaml` | `/usr/local/share/libcamera/ipa/softisp/ov5693.yaml` | calibrated libcamera softISP colour tuning (bayes AWB curve + CCMs derived from the decoded OEM `.aiqb`, re-anchored to a physical unit). CC0-1.0, as libcamera tuning files are. Used by the softISP path (rear camera today; front fallback). |
 | `modprobe.d/ov5693-surface.conf` | `/etc/modprobe.d/` | `binned_y_offset=1`: odd offset = GRBG Bayer phase for the PSYS/HAL path. **Consequence: the front camera becomes PSYS-only** — with this default, libcamera (which believes the driver's advertised BGGR) renders it magenta. For the softISP fallback use `binned_y_offset=2`. |
 | `modprobe.d/v4l2loopback-surface.conf`, `modules-load.d/*` | `/etc/modprobe.d/`, `/etc/modules-load.d/` | loopback module options and boot-time loading (v4l2loopback, intel-ipu6-psys). |

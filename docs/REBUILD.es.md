@@ -1791,7 +1791,7 @@ echo "OK: modulo instalado; cargara en el arranque (alias auxiliary + modules-lo
 `/etc/modprobe.d/ov5693-surface.conf`:
 ```
 # La frontal en produccion va por el ISP hardware (PSYS): fase GRBG =
-# offset Y binned IMPAR (1), casada con vflip=1+hflip=1 del perfil HAL.
+# offset Y binned IMPAR (1), casada con vflip=1+hflip=0 del perfil HAL (hflip=0 desde la serie flip-fixes: polaridad HFLIP invertida).
 # El softISP/libcamera de la frontal esperaba offset 2 (BGGR): con este
 # default, usar la frontal por libcamera sale magenta -- la frontal es
 # PSYS-only desde 2026-08-27. La trasera (ov8865) no usa este parametro.

@@ -413,6 +413,41 @@ static int ov5693_flip_vert_configure(struct ov5693_device *ov5693,
 	return 0;
 }
 
+/*
+ * ISP window X offset. Two things pick the value (all of it measured on a
+ * Surface Pro 7+ front module, phases read from raw captures):
+ *
+ * - The binned mode needs the vendor base of 8 (see ov5693_mode_configure();
+ *   a zero X offset there breaks CSI-2 framing). At full resolution the
+ *   base is 0, and the crop leaves one spare column (crop end = crop start
+ *   + width, inclusive), so a one-column offset always fits.
+ *
+ * - At full resolution this follows the upstream flip-polarity series
+ *   ("media: i2c: Surface Pro 7+ camera flip fixes") verbatim: offset 1 in
+ *   the HFLIP=1 (mirrored, FLIP_HORZ bits cleared) state, 0 otherwise. The
+ *   two flip states then carry the SAME phase, so flipping never changes
+ *   the colours. CAVEAT, measured on this unit: both states decode as GBRG,
+ *   one column off the reported SBGGR10 -- it is the mirrored+offset-0
+ *   state that is SBGGR-clean here, i.e. the compensation sits on the wrong
+ *   state. It cannot simply be moved: the un-mirrored readout refuses to
+ *   stream with a one-column window offset (perpetual "Frame sync error",
+ *   no frames), so an upstream fix needs the crop moved instead. Kept
+ *   as-is to stay register-identical to the upstream series; nothing in
+ *   production consumes the full-resolution mode.
+ *
+ * - In the binned readout the mirror does NOT move the Bayer phase (the
+ *   sensor ISP realigns the binning window, same behaviour as the OV8865),
+ *   so the offset must keep its parity constant: always 8. (A one-column
+ *   parity nudge here was tried and turns the HFLIP=1 state magenta.)
+ */
+static u16 ov5693_offset_start_x(struct ov5693_device *ov5693, bool hflip)
+{
+	if (ov5693->mode.binning_x || ov5693->mode.binning_y)
+		return 8;
+
+	return hflip ? 1 : 0;
+}
+
 static int ov5693_flip_horz_configure(struct ov5693_device *ov5693,
 				      bool enable)
 {
@@ -420,8 +455,23 @@ static int ov5693_flip_horz_configure(struct ov5693_device *ov5693,
 		  OV5693_FORMAT2_FLIP_HORZ_SENSOR_EN;
 	int ret;
 
+	/*
+	 * HFLIP is inverted on this sensor: the native readout is mirrored
+	 * and the FLIP_HORZ bits un-mirror it (the init table sets them by
+	 * default, 0x3821 = 0x1e). The vendor (Windows) driver keeps them
+	 * set in every mode table.
+	 */
 	ret = cci_update_bits(ov5693->regmap, OV5693_FORMAT2_REG, bits,
-			      enable ? bits : 0, NULL);
+			      enable ? 0 : bits, NULL);
+	if (ret)
+		return ret;
+
+	/*
+	 * Clearing the bits shifts the Bayer phase one column off the
+	 * reported mbus code; offset the output window to compensate.
+	 */
+	ret = cci_write(ov5693->regmap, OV5693_OFFSET_START_X_REG,
+			ov5693_offset_start_x(ov5693, enable), NULL);
 	if (ret)
 		return ret;
 
@@ -658,9 +708,10 @@ static int ov5693_mode_configure(struct ov5693_device *ov5693)
 	cci_write(ov5693->regmap, OV5693_CROP_START_X_REG,
 		  binned ? 0 : mode->crop.left, &ret);
 
-	/* Offset X */
+	/* Offset X: base per mode, parity compensates the HFLIP Bayer shift. */
 	cci_write(ov5693->regmap, OV5693_OFFSET_START_X_REG,
-		  binned ? 8 : 0, &ret);
+		  ov5693_offset_start_x(ov5693, ov5693->ctrls.hflip &&
+					ov5693->ctrls.hflip->val), &ret);
 
 	/* Output Size X */
 	cci_write(ov5693->regmap, OV5693_OUTPUT_SIZE_X_REG, mode->format.width,

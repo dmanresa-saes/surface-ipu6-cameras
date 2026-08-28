@@ -79,7 +79,7 @@ trap 'exit 130' INT TERM
 echo "[psys-test] parando puentes y recargando driver..."
 systemctl stop surface-psys-bridge surface-camera-relayd@rear surface-ir-bridge
 modprobe -r ov5693
-# offset 1 (impar = GRBG) + vflip=1/hflip=1 en el perfil HAL = imagen derecha;
+# offset 1 (impar = GRBG) + vflip=1/hflip=0 en el perfil HAL (hflip=0 desde la serie flip-fixes) = imagen derecha;
 # lo fija /etc/modprobe.d/ov5693-surface.conf (produccion). NO usar offset 3
 # con vflip=1: el sensor emite frames rotos (CSI2 FIFO overflow).
 modprobe ov5693
