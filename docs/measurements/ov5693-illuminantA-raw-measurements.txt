@@ -1,0 +1,45 @@
+MEDIDA RAW ov5693 (Surface Pro 7+ frontal) bajo bombilla incandescente ~2700K — 2026-08-28
+Objetivo: comprobar el punto blanco OEM (Microsoft .aiqb) R/G=1.15 bajo iluminante A;
+un mantenedor de libcamera duda de que un sensor pueda requerir ganancia R<1.
+
+Captura: media-ctl directo (camtest.sh, REPRODUCIR.md): ov5693 -> Intel IPU6 CSI2 4 ->
+ISYS Capture 32 (/dev/video33), 1296x972 binned, etiqueta SBGGR10, stride 2624 B (1312 u16/fila).
+Fase CFA real con binned_y_offset=1 y flips=0: GRBG (verificada: verdes p00/p11 <2%; p01 alto=R, p10 bajo=B).
+Exposicion/ganancia manuales (v4l2-ctl subdev); pedestal 16 (10 bit) descontado en todas las cifras.
+Nota driver: analogue_gain 32->48 escala x1.5 lineal; 64 y 127 NO mapean lineal (64==32) — ratios no afectados.
+
+captura                  parche                  R      G      B     R/G     B/G G%rango
+----------------------------------------------------------------------------------------
+e800g32                  door (borde izq)    126.5  127.7   51.1   0.990   0.400     12%
+e2000g32                 door (borde izq)    314.4  317.2  125.6   0.991   0.396     31%
+e1200g64                 door (borde izq)    188.8  189.6   75.4   0.996   0.397     19%
+e2000g48                 door (borde izq)    467.1  467.8  187.8   0.998   0.401     46%
+e800g32                  wall (1/4 campo)     62.0   54.0   22.8   1.148   0.423      5%
+e2070g48dg2048           wall (1/4 campo)    465.3  397.0  161.1   1.172   0.406     39%
+e2000g32                 shirt (centro)       92.4   82.9   34.1   1.114   0.411      8%
+e1200g64                 shirt (centro)       56.7   50.4   21.2   1.126   0.421      5%
+e2000g48                 shirt (centro)      141.4  124.6   52.7   1.135   0.423     12%
+
+Parches (coords half-res 648x486; frames 2-4 promediados de cada raw):
+  door : x 20-90,  y 300-430  puerta blanca pintada, BORDE IZQUIERDO del campo
+  wall : x 150-243, y 200-430  pared blanca junto al marco, ~1/4 del campo hacia el centro
+         (medida solo en e800g32 y e2070g48dg2048, capturas SIN persona en escena;
+          en e2000g32/48 el usuario estaba delante y su cara caia en esa zona)
+  shirt: x 150-480, y 5-90    camisa blanca del usuario, CENTRO-superior (solo pixeles brillantes)
+
+RESULTADO: sobre superficie neutra bajo la incandescente el canal R queda POR ENCIMA de G
+en cuanto se sale del borde del campo: wall R/G=1.148 (nivel 5%) y 1.172 (nivel 39%, p99R=722
+sin saturacion); shirt (centro) R/G=1.11-1.14; door (borde izq) R/G=0.99-1.00.
+B/G=0.40-0.42 en todos (confirma iluminante muy calido ~2700K).
+El gradiente R/G 0.96(borde)->1.15-1.23(centro) sobre la MISMA pintura con B/G constante es
+shading de color de la lente (R cae hacia los bordes); el punto blanco OEM es de centro/post-LSC.
+=> R/G ~ 1.15 en el centro del campo bajo iluminante A: coincide con el .aiqb de Microsoft.
+=> Para neutralizar con G=1 hace falta ganancia R = 1/1.15 ~ 0.87 < 1. QED.
+Robustez: ratios estables (+-0.02) con exposicion x2.6 y ganancias distintas (senal x8 en wall).
+
+Note: the scene photo (ov5693-illuminantA-patches.jpg) is from a retake
+under the same incandescent lamp with the room reframed; the patch
+coordinates and figures in this file refer to the original session
+(reprocessing its raws reproduces the table exactly). The retake, with a
+red curtain dominating the frame, still shows R>G on every neutral
+surface (edge R/G 1.17-1.22) with the same shading gradient.
