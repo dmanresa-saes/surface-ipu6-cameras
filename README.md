@@ -11,13 +11,16 @@ the silicon orphaned.
 | camera | sensor | status | device |
 |---|---|---|---|
 | front | OV5693 | **hardware ISP (IPU6 PSYS)**: 1280x720@30 from the 2x2-binned sensor mode, OEM `.aiqb` tuning in Intel's HAL, ~7% CPU | `/dev/video80` — "Surface Front Camera" |
-| IR (Windows Hello) | OV7251 | working, IR illuminator driven with the stream | `/dev/video81` — "Surface IR Camera" |
-| rear | OV8865 | working via libcamera softISP, colour calibrated from the OEM tuning | `/dev/video82` — "Surface Rear Camera" |
+| IR (Windows Hello) | OV7251 | working, IR illuminator driven with the stream, 1.78x brighter mode (`vts_boost=3448`) | `/dev/video81` — "Surface IR Camera" |
+| rear | OV8865 | working via libcamera softISP, colour calibrated from the OEM tuning (explicit `blackLevel: 1024` — the softISP default renders it magenta) | `/dev/video82` — "Surface Rear Camera" |
 
-All three appear in Chrome and any V4L2 app as ordinary webcams, start when
-an application opens the device and stop when it closes — which matters
-more than usual for the IR camera, since the illuminator is lit while it
-streams.
+All three appear in Chrome and any V4L2 app as ordinary webcams, and all
+three are served by **on-demand bridges**: nothing streams until an
+application opens the device, and the sensor powers down a few seconds after
+the last client leaves. That matters more than tidiness — the IR illuminator
+is lit while the sensor streams, and the always-on relay design this replaced
+burned ~20% of a CPU and 3.3 GB of RAM producing a black picture nobody was
+looking at.
 
 Colour, next to Windows 11 rendering the same scene with the same module:
 
@@ -30,10 +33,15 @@ W11 render: white wall neutral to <2% (G/R 0.976 vs 0.965, G/B 1.007 vs
 
 ## Quick start
 
-The canonical, self-contained rebuild playbook is
-[`docs/REBUILD.es.md`](docs/REBUILD.es.md) (in Spanish for now — this README
-covers the highlights; the playbook's commands and embedded code comments
-are English or trivially readable). The short version:
+**Start with [`docs/MIGRACION.es.md`](docs/MIGRACION.es.md)** — the entry
+point for a fresh install. Its "check what is already upstream before
+applying anything" table is the most valuable page in this repository: part
+of this work has since gone upstream or been superseded there, and applying a
+patch your tree already carries breaks the build or duplicates logic. The
+canonical, self-contained rebuild playbook is then
+[`docs/REBUILD.es.md`](docs/REBUILD.es.md) (both in Spanish for now — this
+README covers the highlights; the playbook's commands and embedded code
+comments are English or trivially readable). The short version:
 
 1. **Kernel**: [linux-surface](https://github.com/linux-surface/linux-surface)
    (validated on Ubuntu 24.04, kernel 6.19.8-surface-3). The generic Ubuntu
@@ -42,16 +50,22 @@ are English or trivially readable). The short version:
    `ov7251` (IR), patched `int3472` (sensor power for IR + rear), and
    `ipu6-psys-surface` (the hardware ISP; two-line clone-and-install, see
    its README). Plus v4l2loopback master. Mind the `autoconf.h` prerequisite
-   in [`dkms/README.md`](dkms/README.md).
+   in [`dkms/README.md`](dkms/README.md), and the optional
+   [`config/modprobe.d/ov7251-surface.conf`](config/modprobe.d/ov7251-surface.conf)
+   (`vts_boost=3448`: 15 fps instead of 30, exposure ceiling 3192 lines,
+   **1.78x measured IR brightness**; read its caveats).
+   The rear camera additionally wants Jakob Berg Jespersen's `ov8865` HFLIP
+   polarity fix — see "the rear camera's flip fix" below.
 3. **Userspace**: for the front camera, Intel's `ipu6-camera-bins`,
    `ipu6-camera-hal` (with [`patches/ipu6-camera-hal-bggr-support.patch`](patches/ipu6-camera-hal-bggr-support.patch))
    and `icamerasrc`; for the rear camera, libcamera with
    [`patches/libcamera-local.patch`](patches/libcamera-local.patch) and the
    tuning file in [`config/tuning/libcamera/ov8865.yaml`](config/tuning/libcamera/ov8865.yaml)
    (the front's softISP tuning, [`ov5693.yaml`](config/tuning/libcamera/ov5693.yaml),
-   is also included for reference); patched `v4l2-relayd`. Note the rear
-   tuning sets an explicit 16-bit `blackLevel: 1024` — the softISP default
-   swallows the pedestal on this short-exposure sensor and renders magenta.
+   is also included for reference). Note the rear tuning sets an explicit
+   16-bit `blackLevel: 1024` — the softISP default swallows the pedestal on
+   this short-exposure sensor and renders magenta. `v4l2-relayd` is **no
+   longer needed**: the rear camera has its own on-demand bridge.
 4. **OEM tuning files** (not redistributable — extract them yourself):
    Microsoft ships the Intel colour calibration of all three cameras inside
    the public Surface Pro 7+ driver MSI:
@@ -66,9 +80,14 @@ are English or trivially readable). The short version:
    `graph_settings_ov5693_13P2BA540_BIN_TGL.xml`. Patch the front `.aiqb`
    with [`tools/patch_aiqb_blc.py`](tools/patch_aiqb_blc.py) before
    installing it (see the black-level finding below).
-5. **Bridges and services** ([`bridges/`](bridges/)): the loopback creator,
-   the PSYS bridge (front), the softISP relay (rear) and the IR bridge, with
-   their systemd units and a udev rule.
+5. **Bridges and services** ([`bridges/`](bridges/)): the loopback creator
+   plus the three on-demand bridges — `surface-psys-bridge` (front, Intel HAL
+   on the PSYS hardware ISP), `surface-rear-bridge` (rear, libcamera softISP)
+   and `surface-ir-bridge` (IR, raw Y10 → 8-bit with its own exposure loop
+   and the wedged-start recovery documented in
+   [`bridges/README.md`](bridges/README.md)) — with their systemd units and a
+   udev rule. The superseded always-on `surface-camera-relayd` is kept in the
+   tree, clearly marked, for manual fallback only.
 
 Then any V4L2 viewer works: `ffplay /dev/video80`.
 
@@ -110,6 +129,12 @@ Windows' `ov5693.sys` ([`tools/extract_tables.py`](tools/extract_tables.py)):
   `MIPI_CTRL00 (0x4800) = 0x2d` at stream-on, without which the IPU6 D-PHY
   never locks (that last register is linux-surface PR
   [#2171](https://github.com/linux-surface/linux-surface/pull/2171)'s fix).
+  **That last part is superseded upstream**: Fernando Rimoli's v5 series does
+  it properly (a `clock-noncontinuous` device property per PCI ID in
+  `ipu-bridge`, and a read-modify-write of just `BIT(5)` in the sensor) and
+  went into media-committers `next` on 2026-09-11. On a tree that carries it,
+  use [`patches/ov5693-binned-no-mipictrl.patch`](patches/ov5693-binned-no-mipictrl.patch)
+  — the binned mode alone, no `0x4800` — instead of our original patch.
 
 ### Intel's CPFF/`.aiqb` tuning format, deciphered
 
@@ -167,6 +192,52 @@ pipeline on demand and works around the HAL's known intermittent stuck
 start (first-frame watchdog, SIGINT, driver recycle, retry — measured first
 frame ~0.3 s after a client opens the device when the start is good).
 
+### The IR camera: illuminator, brightness, and a receiver bug that looks like a sensor bug
+
+Nothing in ACPI describes the Windows Hello illuminator: it hangs off the
+sensor's strobe output, and mainline's `ov7251` global init programs strobe
+pattern `0xa5` — the LED fires on alternate frames, so half the frames come
+out black. Programming `0x3005 = 0x08` and `0x3b81 = 0xff` (both read out of
+the vendor `ov7251.sys`) lights it for every frame, and the bridge only
+streams while a client is attached, so the LED is off the rest of the time.
+
+Brightness is then purely a function of integration time: with the
+illuminator lighting the whole window, mean level is linear in exposure
+lines. Porting the Windows Hello *timing* (VTS 522, ~132 fps) turned out to
+be a dead end — 2.4x **darker** at equal gain. The lever that works is a
+longer frame: `vts_boost=3448` gives 15 fps, a 3192-line exposure ceiling and
+**1.78x measured brightness**.
+
+What that exposed is a **receiver** bug, not a sensor one: a share of stream
+starts comes up with nearly every row pinned at 1023 and sometimes absurd
+frame pacing. Only those sessions emit `DPHY fatal error` / `SOT sync error`
+from the first frame, the "1023" rows contain values >1023 (impossible in
+real Y10), the rate is independent of VTS but drifts with the time of day
+(~3% morning to ~50% night), and forcing extreme D-PHY `hs_prepare` values
+reproduces the signature 100% of the time. It is the IPU6's CSI-2 D-PHY
+losing sync at stream start; on Tiger Lake the timings
+`ipu6_isys_csi2_calc_timing()` computes are even discarded by
+`ipu6_isys_mcd_phy_set_power()`. Reported to linux-media with the evidence;
+until it is fixed in the receiver driver, `surface-ir-bridge` detects the
+signature on the first frames and restarts the session (see
+[`bridges/README.md`](bridges/README.md) — **do not "clean up" that logic**).
+
+### The rear camera's flip fix (not ours, check upstream first)
+
+The rear OV8865 needs Jakob Berg Jespersen's HFLIP polarity fix — [1/2] of
+his "media: i2c: Surface Pro 7+ camera flip fixes" series (patchwork
+linux-media 28516, sent with `Cc: stable`), which we confirmed on this
+machine. **His patch is not redistributed here**: check whether your kernel
+already has it (does `ov8865.c` invert the `0x3821` bits relative to v6.19?)
+and otherwise take it from the linux-media posting. We ran it as a
+hand-built module in `/lib/modules/$(uname -r)/updates/`, which any kernel
+update silently reverts — package it as DKMS instead if it is still not
+upstream. Measured here: the flips do **not** move the OV8865's Bayer phase,
+so the colour calibration is unaffected either way; what changes is geometry.
+libcamera asks for `hflip=1 vflip=1` (the SSDB says 180°), and with the
+polarity corrected that is a true 180° rotation; without the patch the rear
+camera comes out horizontally mirrored.
+
 ### Kernel bugs found along the way
 
 - `GPIO_SUPPLY_NAME_LENGTH` in `int3472` is **5** (4 chars + NUL), so
@@ -179,11 +250,15 @@ frame ~0.3 s after a client opens the device when the start is good).
   msgid `20260729-sp7plus-int3472-v2-1-cdfaf97ac3ad@berg.pm`), which maps
   POWER1 to a `dvdd` regulator generically, plus our INT347E → `vdda`
   mapping for the IR camera, which that patch does not cover.
-- `ipu_bridge` leaks its software nodes on driver unbind: after a PCI
-  remove/rescan of the IPU6 they linger in `/sys/kernel/software_nodes/`
-  pointing into unloaded module rodata, and re-probe fails with `-EEXIST`.
-  Consequence: never try to revive a wedged ISYS by PCI rescan; only a
-  reboot recovers.
+- `ipu_bridge` keeps its software nodes registered on unbind by design, but
+  two things then break: the `link-frequencies` values and the `lens-focus`
+  property *name* point into the module's rodata and dangle once it is
+  unloaded (a re-probing sensor reads poisoned link frequencies and fails),
+  and a PCI remove/rescan makes it re-register the IPU HID node, which fails
+  with `-EEXIST`. Two patches for this are in
+  [`patches/`](patches/) and were sent to linux-media — **still unapplied**.
+  Consequence without them: never try to revive a wedged ISYS by PCI rescan;
+  only a reboot recovers.
 - (userspace, but in the same spirit) `v4l2-relayd` listens for the wrong
   loopback event ID; the real `CLIENT_USAGE` event is
   `V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1`
@@ -207,9 +282,67 @@ frame ~0.3 s after a client opens the device when the start is good).
 - **Front camera is PSYS-only as configured**: with `binned_y_offset=1`,
   using it through libcamera renders magenta (Bayer phase mismatch). The
   softISP fallback is documented in [`config/README.md`](config/README.md).
-- **Rear camera colour is not calibrated yet** (its OEM `.aiqb` decodes
-  fine; same method as the front applies). Rear PSYS is future work.
-- The libcamera and HAL patches are local; none of this is upstream yet.
+- **Rear camera colour is calibrated** (2026-08-28, same method as the
+  front: OEM `.aiqb` curve anchored on this physical unit, r x1.07 / b
+  x1.083, plus the explicit `blackLevel: 1024`), but it runs on libcamera's
+  **software** ISP. Rear PSYS is future work.
+- **Rear camera geometry**: the softISP renders 1596x896 and crops 2 px all
+  round before scaling to 720p. Both numbers are load-bearing — at 1600 and
+  1920 wide the GPU resampler lays down magenta rows and a dark column, and
+  the debayer's border carries an incomplete Bayer phase. Details in
+  [`bridges/README.md`](bridges/README.md).
+- **A share of IR stream starts comes up wedged** — the IPU6 D-PHY bug
+  above. The bridge recovers it in 0.5-2 s; the underlying fix belongs in
+  the kernel and does not exist yet.
+- **The `ipu-bridge` patches are not upstream**, so on a stock tree a PCI
+  remove/rescan of the IPU6 is fatal until reboot.
+- The libcamera and Intel HAL patches are local. See the upstream status
+  below for what did land.
+
+## Upstream status (honest version, as of 2026-09-22)
+
+This is a snapshot, not a promise: the author no longer has the hardware, so
+nothing here will be re-tested by us. Anyone is welcome to pick any of it up.
+
+**Landed / superseded upstream — prefer upstream over this repo:**
+
+- **The `MIPI_CTRL00` write is superseded.** Fernando Rimoli's series "media:
+  Enable the OV5693 front camera on IPU6 Surface devices" (v5) implements it
+  properly — a `clock-noncontinuous` property per PCI ID in `ipu-bridge` plus
+  an RMW of `BIT(5)` in the sensor — and went into media-committers `next` on
+  **2026-09-11**. Of the four bits our `0x2d` set (0, 2, 3, 5) only bit 5
+  does anything: Fil Dunsky swept them on a Surface Pro 8, and we confirmed
+  it here by measuring that the CSI-2 error signature is identical with
+  `0x2d` and with bit-5-only. On a tree with that series, use
+  [`patches/ov5693-binned-no-mipictrl.patch`](patches/ov5693-binned-no-mipictrl.patch).
+- A **third rodata literal** of the same class as the two our `ipu-bridge`
+  1/2 fixes (`clock-noncontinuous`, introduced by that series) is fixed by
+  Rimoli's follow-up patch *"media: ipu-bridge: Keep the clock-noncontinuous
+  property name out of rodata"*, which credits this work as `Reported-by`.
+
+**Sent, reviewed, still not applied (check before you apply ours):**
+
+- `int3472`: POWER1 (type `0x08`) → `dvdd`, Jespersen's v3 (Reviewed-by Hans
+  de Goede), and our `INT347E` → `vdda` for the IR camera (v2, Reviewed-by +
+  Tested-by). Both sat in patchwork as *handled-elsewhere* on 2026-09-22,
+  not in master.
+- `ipu-bridge`: our two patches (rodata-free software nodes; reuse the nodes
+  on rebind), Message-IDs `20260831140304.45940-2@gmail.com` and `-3`, still
+  in state *new* after Sakari Ailus's review of v1.
+- libcamera: an RFC for a `gainMin` key in the AWB tuning, unanswered.
+- The IPU6 **D-PHY desync at stream start** was reported with evidence; no
+  kernel-side fix exists. The IR bridge's retry is all there is.
+- `ov7251` `V4L2_CID_ANALOGUE_GAIN`: Dan Scally's 2023 patch, never
+  mainlined and rediscovered three times. libcamera will not enumerate the
+  sensor without it.
+
+**Withdrawn:** Jespersen withdrew the `ov5693` half ([2/2]) of his flip
+series after reproducing our Bayer-phase measurements — his compensation is
+correct only in the `VFLIP=1` state. The `ov8865` half stands.
+
+**Nobody has taken upstream:** the OV5693 2x2-binned mode itself (the heart
+of this repository), the PSYS build recipe, and the BGGR support in Intel's
+HAL ([PR #182](https://github.com/intel/ipu6-camera-hal/pull/182)).
 
 ## Hardware and software tested
 
@@ -219,8 +352,15 @@ frame ~0.3 s after a client opens the device when the start is good).
   `ipu6_fw.bin`.
 - libcamera @ `35c137c`, intel/ipu6-camera-hal @ master (patch verified
   against `6fefa86`), icamerasrc branch `icamerasrc_slim_api`,
-  intel/ipu6-drivers @ `71bddb5`, v4l2loopback master, v4l2-relayd @
-  `f14d6d4`.
+  intel/ipu6-drivers @ `71bddb5`, v4l2loopback master. (`v4l2-relayd`
+  @ `f14d6d4` was used by the superseded always-on rear relay and is not
+  needed any more.)
+- From 2026-09-06 the machine additionally ran hand-built `ipu-bridge`,
+  `intel-ipu6` and `ov5693` modules carrying Rimoli's v5 series plus ours,
+  to test the binned readout and the PSYS path against what is now upstream
+  (all three cameras verified in that configuration). The DKMS sources in
+  this repository are the pre-v5 variant, which works identically on a tree
+  without the series.
 
 Other IPU6 Tiger Lake machines with these sensors should be close (module
 colour variation measured at ~9%; the tuning method is documented), but
@@ -232,10 +372,10 @@ only this machine is verified.
 |---|---|---|
 | `patches/` | clean, `-p1`-applicable diffs against the baselines listed in [`patches/README.md`](patches/README.md) | kernel patches GPL-2.0 · libcamera patch LGPL-2.1+ · HAL patch Apache-2.0 · v4l2-relayd patch GPL-2.0 (each under its upstream's license) |
 | `dkms/` | the four DKMS packages (patched sources + `dkms.conf` + installers) | GPL-2.0 |
-| `bridges/` | the four bridge scripts, systemd units, udev rule | MIT |
+| `bridges/` | the three on-demand bridge scripts + the loopback creator + the superseded relay, systemd units, udev rule | MIT |
 | `tools/` | `.aiqb` decoder/patchers, Windows-driver table extractor, `autoconf.h` generator, test scripts | MIT |
 | `config/` | HAL sensor profile (own work), libcamera tuning YAML, modprobe/modules-load snippets | MIT, except `ov5693.yaml` (CC0-1.0) |
-| `docs/` | the full rebuild playbook + comparison images | CC-BY-4.0 (images are the author's own captures) |
+| `docs/` | the fresh-install entry point (`MIGRACION.es.md`), the full rebuild playbook (`REBUILD.es.md`) + comparison images and raw measurements | CC-BY-4.0 (images are the author's own captures) |
 
 License texts are in [`LICENSES/`](LICENSES/). **This repository contains no
 Microsoft or Intel material**: no `.aiqb`, no `graph_settings*.xml`, no
@@ -247,7 +387,7 @@ from public sources, and tools to decode/patch what you extracted yourself.
 This project was undertaken as an experiment: to see how far reverse
 engineering and systems bring-up can go with a capable AI doing the hands-on
 work, guided closely by a human. The analysis, code, patches and measurements
-were produced by **Anthropic's Claude (Fable 5, and Opus in earlier
+were produced by **Anthropic's Claude (Fable 5, and Opus 4.5/5 in other
 sessions)** working directly on the machine — capturing raw frames,
 disassembling the Windows drivers, deciphering the tuning format, iterating
 against the hardware — with the direction, judgment calls, priorities and
@@ -258,6 +398,35 @@ by human eyes. Claude Fable 5 and Claude Opus are credited as co-authors in
 the git history.
 
 ## Acknowledgements and prior art
+
+This stopped being a solo exercise fairly quickly. People who tested things
+on hardware we do not have, or who contributed findings that changed what is
+in this repository:
+
+- **Jakob Berg Jespersen** — the "Surface Pro 7+ camera flip fixes" series
+  (the `ov8865` HFLIP polarity fix the rear camera here depends on) and the
+  `int3472` POWER1 patch our own patch now follows; a second Pro 7+ tested.
+  He withdrew his `ov5693` [2/2] after reproducing our Bayer-phase
+  measurements — the kind of exchange that makes a list worth writing to.
+- **Fil Dunsky** (`fildunsky`) — Surface Pro 8: confirmed the binned OV5693
+  and the `int3472` rails on a second model, swept the bits of our
+  `MIPI_CTRL00 = 0x2d` down to the one that matters (`BIT(5)`), extracted the
+  vendor GPIO-type table from `iactrllogic64.sys` (`0x07` Power0, `0x08`
+  Power1, `0x0b` PowerEn, `0x10` Avdd, `0x11` Core) — which is how we learned
+  that mainline's name for type `0x10` is probably wrong — and reported the
+  empty `0x10` case that leaves a rail unpowered.
+- **Kengo Oki** (`Fugu0141`) — Surface Go 4 (Alder Lake-N): testing on a
+  third IPU6 generation.
+- **Fernando Rimoli** — the `clock-noncontinuous` series that supersedes our
+  `MIPI_CTRL00` write and does it the right way, and the follow-up rodata
+  fix.
+- **Dan Scally** — the original Surface camera support (`int3472`,
+  `ipu-bridge`, `cio2-bridge` before it) that every one of these machines
+  stands on, and the `ov7251` `ANALOGUE_GAIN` patch.
+- **Hans de Goede** and **Sakari Ailus** — reviews on the `int3472` and
+  `ipu-bridge` work, and the design guidance behind both.
+
+Prior art and components:
 
 - [linux-surface](https://github.com/linux-surface/linux-surface) — the
   kernel this runs on, and PR
