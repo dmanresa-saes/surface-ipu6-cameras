@@ -90,6 +90,14 @@
 #define OV7251_TIMING_MIN_VTS		1
 #define OV7251_TIMING_MAX_VTS		0xffff
 #define OV7251_INTEGRATION_MARGIN	20
+/*
+ * Measured on the Surface Pro 7+ unit: starting a stream with exposure closer
+ * than ~250 lines to VTS intermittently wedges the exposure engine (rows come
+ * out pinned at 1023 for the whole session; ~33% of sessions at VTS-20, 0/16
+ * at VTS-248..448). Keep the mainline margin for the stock modes and use this
+ * safer margin for the long-integration vts_boost mode.
+ */
+#define OV7251_BOOST_INTEGRATION_MARGIN	256
 
 struct reg_value {
 	u16 reg;
@@ -392,6 +400,143 @@ static const struct reg_value ov7251_setting_vga_30fps[] = {
 	{ 0x5001, 0x80 },
 };
 
+/*
+ * 640x480 timing as programmed by the Windows vendor driver (ov7251.sys mode
+ * table at VA 0x14001e60c, the IR-illuminated Windows Hello mode: strobe
+ * pattern 0x3b81=0xff and pad-out 0x3005=0x08). Identical to the 30fps table
+ * above except for the pad drive registers (0x3016-0x301c), 0x3664, 0x5000,
+ * VTS 522 (vs 1724) and the PLL1 MIPI divider 0x30b5=0x01 (vs 0x05); the rest
+ * of PLL1 matches the 19.2 MHz / 319.2 MHz link configuration, so this mode
+ * runs the link at 638.4 Mbps with a 63.84 MHz pixel clock: 522 * 928 /
+ * 63.84 MHz = 7.59 ms per frame, ~132 fps. Selected by win_timing=1.
+ */
+static const struct reg_value ov7251_setting_vga_win[] = {
+	{ 0x3005, 0x08 },
+	{ 0x3012, 0xc0 },
+	{ 0x3013, 0xd2 },
+	{ 0x3014, 0x04 },
+	{ 0x3016, 0x10 },
+	{ 0x3017, 0x00 },
+	{ 0x3018, 0x00 },
+	{ 0x301a, 0x00 },
+	{ 0x301b, 0x00 },
+	{ 0x301c, 0x00 },
+	{ 0x3023, 0x05 },
+	{ 0x3037, 0xf0 },
+	{ 0x3106, 0xda },
+	{ 0x3503, 0x07 },
+	{ 0x3509, 0x10 },
+	{ 0x3600, 0x1c },
+	{ 0x3602, 0x62 },
+	{ 0x3620, 0xb7 },
+	{ 0x3622, 0x04 },
+	{ 0x3626, 0x21 },
+	{ 0x3627, 0x30 },
+	{ 0x3630, 0x44 },
+	{ 0x3631, 0x35 },
+	{ 0x3634, 0x60 },
+	{ 0x3636, 0x00 },
+	{ 0x3662, 0x01 },
+	{ 0x3663, 0x70 },
+	{ 0x3664, 0xf0 },
+	{ 0x3666, 0x0a },
+	{ 0x3669, 0x1a },
+	{ 0x366a, 0x00 },
+	{ 0x366b, 0x50 },
+	{ 0x3673, 0x01 },
+	{ 0x3674, 0xff },
+	{ 0x3675, 0x03 },
+	{ 0x3705, 0xc1 },
+	{ 0x3709, 0x40 },
+	{ 0x373c, 0x08 },
+	{ 0x3742, 0x00 },
+	{ 0x3757, 0xb3 },
+	{ 0x3788, 0x00 },
+	{ 0x37a8, 0x01 },
+	{ 0x37a9, 0xc0 },
+	{ 0x3800, 0x00 },
+	{ 0x3801, 0x04 },
+	{ 0x3802, 0x00 },
+	{ 0x3803, 0x04 },
+	{ 0x3804, 0x02 },
+	{ 0x3805, 0x8b },
+	{ 0x3806, 0x01 },
+	{ 0x3807, 0xeb },
+	{ 0x3808, 0x02 }, /* width high */
+	{ 0x3809, 0x80 }, /* width low */
+	{ 0x380a, 0x01 }, /* height high */
+	{ 0x380b, 0xe0 }, /* height low */
+	{ 0x380c, 0x03 }, /* total horiz timing high */
+	{ 0x380d, 0xa0 }, /* total horiz timing low */
+	{ 0x380e, 0x02 }, /* total vertical timing high */
+	{ 0x380f, 0x0a }, /* total vertical timing low */
+	{ 0x3810, 0x00 },
+	{ 0x3811, 0x04 },
+	{ 0x3812, 0x00 },
+	{ 0x3813, 0x05 },
+	{ 0x3814, 0x11 },
+	{ 0x3815, 0x11 },
+	{ 0x3820, 0x40 },
+	{ 0x3821, 0x00 },
+	{ 0x382f, 0x0e },
+	{ 0x3832, 0x00 },
+	{ 0x3833, 0x05 },
+	{ 0x3834, 0x00 },
+	{ 0x3835, 0x0c },
+	{ 0x3837, 0x00 },
+	{ 0x3b80, 0x00 },
+	{ 0x3b81, 0xff },
+	{ 0x3b82, 0x10 },
+	{ 0x3b83, 0x00 },
+	{ 0x3b84, 0x08 },
+	{ 0x3b85, 0x00 },
+	{ 0x3b86, 0x01 },
+	{ 0x3b87, 0x00 },
+	{ 0x3b88, 0x00 },
+	{ 0x3b89, 0x00 },
+	{ 0x3b8a, 0x00 },
+	{ 0x3b8b, 0x05 },
+	{ 0x3b8c, 0x00 },
+	{ 0x3b8d, 0x00 },
+	{ 0x3b8e, 0x00 },
+	{ 0x3b8f, 0x1a },
+	{ 0x3b94, 0x05 },
+	{ 0x3b95, 0xf2 },
+	{ 0x3b96, 0x40 },
+	{ 0x3c00, 0x89 },
+	{ 0x3c01, 0x63 },
+	{ 0x3c02, 0x01 },
+	{ 0x3c03, 0x00 },
+	{ 0x3c04, 0x00 },
+	{ 0x3c05, 0x03 },
+	{ 0x3c06, 0x00 },
+	{ 0x3c07, 0x06 },
+	{ 0x3c0c, 0x01 },
+	{ 0x3c0d, 0xd0 },
+	{ 0x3c0e, 0x02 },
+	{ 0x3c0f, 0x0a },
+	{ 0x4001, 0x42 },
+	{ 0x4004, 0x04 },
+	{ 0x4005, 0x00 },
+	{ 0x404e, 0x01 },
+	{ 0x4300, 0xff },
+	{ 0x4301, 0x00 },
+	{ 0x4501, 0x48 },
+	{ 0x4600, 0x00 },
+	{ 0x4601, 0x4e },
+	{ 0x4801, 0x0f },
+	{ 0x4806, 0x0f },
+	{ 0x4819, 0xaa },
+	{ 0x4823, 0x3e },
+	{ 0x4837, 0x19 },
+	{ 0x4a0d, 0x00 },
+	{ 0x4a47, 0x7f },
+	{ 0x4a49, 0xf0 },
+	{ 0x4a4b, 0x30 },
+	{ 0x5000, 0x87 },
+	{ 0x5001, 0x80 },
+};
+
 static const struct reg_value ov7251_setting_vga_60fps[] = {
 	{ 0x3005, 0x00 },
 	{ 0x3012, 0xc0 },
@@ -648,6 +793,26 @@ static const struct reg_value ov7251_setting_vga_90fps[] = {
 	{ 0x5001, 0x80 },
 };
 
+static int win_timing;
+module_param(win_timing, int, 0444);
+MODULE_PARM_DESC(win_timing,
+		 "Use the Windows vendor driver 640x480 timing (VTS 522, 638.4 Mbps link, ~132 fps) instead of the default 30 fps mode");
+
+/*
+ * Brightness lever, measured on the Surface Pro 7+ unit: with the IR strobe
+ * lighting the whole integration window, mean signal is linear in exposure
+ * lines (19.33 us/line at the 240 MHz link), so the only way to a brighter
+ * frame is a higher exposure ceiling, which is VTS-bound. Raising the default
+ * mode's VTS trades frame rate for ceiling: 3448 -> 15 fps / 66 ms max
+ * integration (2x today's), 6896 -> 7.5 fps / 4x. Ignored if win_timing=1.
+ * The consumer must also ask for the longer exposure (surface-ir-bridge
+ * clamps at its own EXPOSURE_MAX).
+ */
+static int vts_boost;
+module_param(vts_boost, int, 0444);
+MODULE_PARM_DESC(vts_boost,
+		 "Override default 640x480 mode VTS (1724 = 30 fps; larger = slower + higher exposure ceiling; 0 = off)");
+
 static const unsigned long supported_xclk_rates[] = {
 	[OV7251_19_2_MHZ] = 19200000,
 	[OV7251_24_MHZ] = 24000000,
@@ -663,7 +828,10 @@ static const s64 pixel_rates[] = {
 	[OV7251_LINK_FREQ_319_2_MHZ] = 63840000,
 };
 
-static const struct ov7251_mode_info ov7251_mode_info_data[] = {
+/*
+ * Not const: entry 0 is replaced by ov7251_win_mode when win_timing=1.
+ */
+static struct ov7251_mode_info ov7251_mode_info_data[] = {
 	{
 		.width = 640,
 		.height = 480,
@@ -703,6 +871,21 @@ static const struct ov7251_mode_info ov7251_mode_info_data[] = {
 			.denominator = 9043
 		}
 	},
+};
+
+/* Windows vendor timing, substituted for entry 0 above when win_timing=1. */
+static const struct ov7251_mode_info ov7251_win_mode = {
+	.width = 640,
+	.height = 480,
+	.vts = 522,
+	.data = ov7251_setting_vga_win,
+	.data_size = ARRAY_SIZE(ov7251_setting_vga_win),
+	.exposure_max = 502,
+	.exposure_def = 400,
+	.timeperframe = {
+		.numerator = 100,
+		.denominator = 13179
+	}
 };
 
 static int ov7251_regulators_enable(struct ov7251 *ov7251)
@@ -855,7 +1038,12 @@ static int ov7251_pll_configure(struct ov7251 *ov7251)
 	if (ret < 0)
 		return ret;
 
+	/*
+	 * The Windows vendor timing runs the PLL1 of the 319.2 MHz link
+	 * configuration but with the MIPI divider at 0x01 instead of 0x05.
+	 */
 	ret = ov7251_write_reg(ov7251, OV7251_PLL1_MIPI_DIV_REG,
+			       win_timing ? 0x01 :
 			       configs->pll1[ov7251->link_freq_idx]->mipi_div);
 	if (ret < 0)
 		return ret;
@@ -966,6 +1154,15 @@ static int ov7251_set_power_on(struct device *dev)
 		return ret;
 	}
 
+	/*
+	 * Global init issues a software reset (0x0103); give it time to settle
+	 * before s_stream starts writing the PLL and mode registers, which can
+	 * happen microseconds after this returns (pm_runtime resume path).
+	 * Without this, sessions intermittently start with the exposure engine
+	 * wedged (rows pinned at full scale, sometimes garbage frame timing).
+	 */
+	usleep_range(5000, 6000);
+
 	return ret;
 }
 
@@ -1059,7 +1256,9 @@ static int ov7251_s_ctrl(struct v4l2_ctrl *ctrl)
 		int exposure_max;
 
 		exposure_max = ov7251->current_mode->height + ctrl->val -
-			       OV7251_INTEGRATION_MARGIN;
+			       (vts_boost && !win_timing ?
+				OV7251_BOOST_INTEGRATION_MARGIN :
+				OV7251_INTEGRATION_MARGIN);
 		__v4l2_ctrl_modify_range(ov7251->exposure,
 					 ov7251->exposure->minimum,
 					 exposure_max,
@@ -1703,6 +1902,30 @@ static int ov7251_probe(struct i2c_client *client)
 	ret = ov7251_check_hwcfg(ov7251);
 	if (ret)
 		return ret;
+
+	if (win_timing) {
+		/*
+		 * The Windows timing runs the sensor's 319.2 MHz link PLL
+		 * (with the MIPI divider tweak in ov7251_pll_configure), so
+		 * report that link frequency regardless of what the fwnode
+		 * advertised: the IPU6 CSI-2 receiver reads the rate from the
+		 * sensor's LINK_FREQ control at stream time.
+		 */
+		ov7251->link_freq_idx = OV7251_LINK_FREQ_319_2_MHZ;
+		ov7251_mode_info_data[0] = ov7251_win_mode;
+		dev_info(dev, "win_timing=1: Windows vendor 640x480 timing (VTS 522, 638.4 Mbps)\n");
+	} else if (vts_boost > 522 && vts_boost <= OV7251_TIMING_MAX_VTS) {
+		struct ov7251_mode_info *mode = &ov7251_mode_info_data[0];
+
+		mode->vts = vts_boost;
+		mode->exposure_max = vts_boost - OV7251_BOOST_INTEGRATION_MARGIN;
+		/* 30 fps at the stock VTS of 1724, scaled down from there */
+		mode->timeperframe.denominator = (3000u * 1724) / vts_boost;
+		dev_info(dev, "vts_boost=%d: default mode at %u.%02u fps, exposure ceiling %u lines\n",
+			 vts_boost, mode->timeperframe.denominator / 100,
+			 mode->timeperframe.denominator % 100,
+			 mode->exposure_max);
+	}
 
 	/* get system clock (xclk) */
 	ov7251->xclk = devm_v4l2_sensor_clk_get(dev, NULL);
