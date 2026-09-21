@@ -1,0 +1,95 @@
+From b174390dbfa5cddd6bf65977e067f333ae6ce9f3 Mon Sep 17 00:00:00 2001
+From: "D. Manresa" <dmanresa@gmail.com>
+Date: Mon, 31 Aug 2026 11:07:04 +0200
+Subject: [PATCH v2 2/2] media: ipu-bridge: reuse the software nodes on rebind
+
+The software nodes registered by ipu_bridge_init() are deliberately
+never unregistered, and the intended design is for a rebind to reuse
+the already registered nodes. That reuse path however only exists for
+the case where the IPU device kept its secondary fwnode link, which the
+fwnode graph check at the top of ipu_bridge_init() detects: then the
+function returns early. When the link is gone, ipu_bridge_init()
+unconditionally registers the IPU HID software node again, which fails
+with -EEXIST on the sysfs name (the node from the previous bind is
+still registered) and the IPU driver fails to probe.
+
+That is exactly what happens when the IPU PCI device is removed and
+re-scanned: device_del() unsets the ACPI companion, and
+set_primary_fwnode(dev, NULL) then clears the ACPI fwnode's ->secondary
+pointer, so the fwnode graph check on the next probe finds no endpoints
+and falls through to registration. Observed on a Surface Pro 7+ (IPU6):
+
+  echo 1 > /sys/bus/pci/devices/0000:00:05.0/remove
+  modprobe -r intel_ipu6_isys intel_ipu6   # ipu-bridge unloads too
+  echo 1 > /sys/bus/pci/rescan
+  modprobe intel_ipu6
+
+  sysfs: cannot create duplicate filename '/kernel/software_nodes/INT343E'
+  intel-ipu6 0000:00:05.0: Failed to register the IPU HID node
+  intel-ipu6: probe of 0000:00:05.0 failed with error -17
+
+after which the cameras are unusable until reboot.
+
+Add the missing reuse path: if the IPU software node is already
+registered, look it up with software_node_find_by_name(), point the
+device's secondary fwnode at it and return success. That is all a
+rebind needs: the sensor, IVSC and VCM links live on devices that
+survive an IPU unbind, so nothing has cleared those.
+
+software_node_find_by_name() takes a reference on the node it returns;
+drop it right away since the node is kept alive by its never dropped
+registration.
+
+Assisted-by: LLM
+
+Fixes: 803abec64ef9 ("media: ipu3-cio2: Add cio2-bridge to ipu3-cio2 driver")
+Signed-off-by: D. Manresa <dmanresa@gmail.com>
+---
+ drivers/media/pci/intel/ipu-bridge.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/drivers/media/pci/intel/ipu-bridge.c b/drivers/media/pci/intel/ipu-bridge.c
+index 4de42ed..6fa1c3c 100644
+--- a/drivers/media/pci/intel/ipu-bridge.c
++++ b/drivers/media/pci/intel/ipu-bridge.c
+@@ -930,6 +930,7 @@ static DEFINE_MUTEX(ipu_bridge_mutex);
+ int ipu_bridge_init(struct device *dev,
+ 		    ipu_parse_sensor_fwnode_t parse_sensor_fwnode)
+ {
++	const struct software_node *ipu_node;
+ 	struct fwnode_handle *fwnode;
+ 	struct ipu_bridge *bridge;
+ 	unsigned int i;
+@@ -940,6 +941,29 @@ int ipu_bridge_init(struct device *dev,
+ 	if (!ipu_bridge_check_fwnode_graph(dev_fwnode(dev)))
+ 		return 0;
+ 
++	/*
++	 * The software nodes registered by a previous ipu_bridge_init() call
++	 * are deliberately kept registered when the module is unloaded, and
++	 * the sensors' ACPI fwnodes still have them as their secondary
++	 * fwnodes. If the IPU software node is already registered this is a
++	 * rebind, e.g. after the PCI device was removed and re-scanned,
++	 * which drops the IPU's secondary fwnode link. Registering the nodes
++	 * again would fail with -EEXIST, so instead reuse them and just
++	 * restore the IPU's secondary fwnode link.
++	 */
++	ipu_node = software_node_find_by_name(NULL, IPU_HID);
++	if (ipu_node) {
++		fwnode = software_node_fwnode(ipu_node);
++		set_secondary_fwnode(dev, fwnode);
++		/*
++		 * The node stays registered, it does not need the reference
++		 * software_node_find_by_name() took to stay alive.
++		 */
++		fwnode_handle_put(fwnode);
++		dev_dbg(dev, "Reusing the previously registered software nodes\n");
++		return 0;
++	}
++
+ 	if (!ipu_bridge_ivsc_is_ready())
+ 		return dev_err_probe(dev, -EPROBE_DEFER,
+ 				     "waiting for IVSC to become ready\n");
+-- 
+2.43.0
+
