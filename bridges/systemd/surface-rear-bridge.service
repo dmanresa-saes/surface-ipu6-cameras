@@ -1,0 +1,22 @@
+[Unit]
+Description=Surface rear camera bridge (OV8865 libcamera softISP -> v4l2loopback)
+Requires=surface-camera-loopbacks.service
+After=surface-camera-loopbacks.service
+# La trasera es de este puente; el relayd siempre-activo no debe arrancar a
+# la vez (dos productores sobre /dev/video82).
+Conflicts=surface-camera-relayd@rear.service
+
+[Service]
+Type=simple
+Environment=REAR_BRIDGE_DEBUG=
+ExecStart=/usr/local/bin/surface-rear-bridge
+Restart=always
+RestartSec=2
+# SIGTERM solo al daemon: el hijo gst-launch (libcamerasrc) lo para el daemon
+# con SIGINT y espera; nunca TERM/KILL sobre un stream IPU6 vivo. El
+# presupuesto de parada del daemon es de 20 s, deja margen antes del KILL.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

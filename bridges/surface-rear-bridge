@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Surface Pro 7+ REAR camera (OV8865) -> v4l2loopback, on demand.
+
+Producer pipeline (root): libcamerasrc (software ISP) -> RGB 1596x896 ->
+crop 2 px -> scale 1280x720 -> YUY2 -> fdsink; this daemon owns the
+loopback producer fd and relays the frames to /dev/video82.
+
+Why this replaces v4l2-relayd (design decision, 2026-08-30):
+ - v4l2-relayd runs its splash pipeline for ever, whether or not anybody
+   has the loopback open. Measured 2026-08-29: 7 h of "idle" cost ~20 %
+   of a CPU and 3.3 GB RSS with the sensor SUSPENDED the whole time --
+   the entire bill was videotestsrc feeding a loopback nobody read, with
+   buffers piling up inside the relay.
+ - Same on-demand shape as surface-psys-bridge (front) and
+   surface-ir-bridge (IR): nothing runs until a client opens the device.
+
+The gst element chain below is NOT a style choice; every piece fixes a
+measured bug and must be kept verbatim (see REPRODUCIR.md s.4/s.6):
+ - render 1596x896: the software ISP emits black frames when asked for
+   less than ~1296 px wide off a full-resolution readout, and the GPU
+   resampler lays magenta rows / a dark column at 1600/1920 wide. 1596 is
+   the width with none of that.
+ - videocrop 2 px all round: the debayer's border rows/columns carry an
+   incomplete Bayer phase and come out magenta after the CCM.
+ - videorate skip-to-first=true: without it the first frame is repeated
+   for every "missing" slot since the pipeline clock started = a picture
+   frozen for seconds ("camera frozen" bug).
+ - the loopback is written by THIS process, never by a v4l2sink, and its
+   format is set ONCE here before any client exists: S_FMT on a loopback
+   a client has already negotiated loops on EBUSY, and
+   `v4l2loopback-ctl set-caps` makes the device advertise CAPTURE to
+   everyone so no producer can open it for output again.
+"""
+
+import fcntl
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+W, H, FPS = 1280, 720, 30
+FRAME_SIZE = W * H * 2
+LOOPBACK_LABEL = "Surface Rear Camera"
+CAM_ID = r"\\_SB_.PC00.I2C3.CAMR"   # gst_parse_launch eats one backslash level
+GST_PLUGIN_PATH = "/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0"
+
+GST_CMD = [
+    "gst-launch-1.0", "-q",
+    "libcamerasrc", f"camera-name={CAM_ID}", "!",
+    "video/x-raw,width=1596,height=896", "!",
+    "videocrop", "top=2", "left=2", "right=2", "bottom=2", "!",
+    "videoscale", "!",
+    "videorate", "skip-to-first=true", "!",
+    f"video/x-raw,width={W},height={H},framerate={FPS}/1", "!",
+    "videoconvert", "!",
+    "video/x-raw,format=YUY2", "!",
+    "fdsink", "fd=1",
+]
+
+# A good start delivers its first frame in ~2-4 s (libcamera has to bring up
+# the sensor, the ISYS and an EGL context). 20 s separates that cleanly from
+# a start that will never deliver.
+FIRST_FRAME_TIMEOUT = 20.0
+MAX_ATTEMPTS = 3
+# How long every client has to be gone before the camera is shut down.
+# Doubles as a linger window: players open/probe/close/reopen, and a
+# reopen inside the grace reuses the running pipeline (first frame is then
+# immediate instead of paying the ~2 s libcamera start again).
+CLIENT_GRACE = 3.0
+# SIGINT-and-wait budget for the gst child.
+STOP_BUDGET = 20.0
+# A producer that keeps dying under a live client must not spin.
+MAX_RESTARTS_PER_MIN = 5
+
+# --- v4l2 ioctls (same layouts as surface-psys-bridge) ----------------------
+VIDIOC_S_FMT = 0xC0D05605
+VIDIOC_S_PARM = 0xC0CC5616
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565A
+VIDIOC_DQEVENT = 0x80885659  # struct v4l2_event is 136 bytes; wrong size => ENOTTY
+BUF_TYPE_OUTPUT = 2
+FMT_YUYV = 0x56595559
+# v4l2loopback signals this when the number of capturing clients changes.
+V4L2_EVENT_PRI_CLIENT_USAGE = 0x08000000 + 0x08E00000 + 1
+
+DEBUG = os.environ.get("REAR_BRIDGE_DEBUG")
+
+# Black in YUY2: Y=16, U=V=128 (video range).
+BLACK_FRAME = bytes([16, 128]) * (W * H)
+
+
+def log(msg):
+    print(f"[{time.monotonic():.3f}] {msg}", flush=True)
+
+
+def find_loopback(label):
+    for name in sorted(os.listdir("/sys/devices/virtual/video4linux")):
+        try:
+            path = f"/sys/devices/virtual/video4linux/{name}/name"
+            if open(path).read().strip() == label:
+                return "/dev/" + name
+        except OSError:
+            pass
+    return None
+
+
+def s_fmt_output(fd):
+    fmt = bytearray(204)
+    struct.pack_into("I", fmt, 0, BUF_TYPE_OUTPUT)
+    struct.pack_into("IIII", fmt, 8, W, H, FMT_YUYV, 1)
+    fcntl.ioctl(fd, VIDIOC_S_FMT, fmt)
+
+
+def s_parm_output(fd):
+    """Advertise 30 fps (v4l2_outputparm.timeperframe = 1/30)."""
+    parm = bytearray(204)
+    struct.pack_into("I", parm, 0, BUF_TYPE_OUTPUT)
+    struct.pack_into("II", parm, 4, 0x1000, 0)   # capability=TIMEPERFRAME, outputmode
+    struct.pack_into("II", parm, 12, 1, FPS)     # timeperframe num/den
+    try:
+        fcntl.ioctl(fd, VIDIOC_S_PARM, parm)
+    except OSError as exc:
+        log(f"S_PARM failed ({exc}); fps stays at the loopback default")
+
+
+def poll_client_count(fd):
+    """Newest capture-client count, or None if unchanged. POLLPRI = the
+    THIRD list select() returns; reading the first one misses every event."""
+    count = None
+    while True:
+        _, _, x = select.select([], [], [fd], 0)
+        if not x:
+            return count
+        ev = bytearray(136)
+        try:
+            fcntl.ioctl(fd, VIDIOC_DQEVENT, ev)
+        except OSError:
+            return count
+        if struct.unpack_from("I", ev, 0)[0] == V4L2_EVENT_PRI_CLIENT_USAGE:
+            count = struct.unpack_from("I", ev, 8)[0]
+
+
+def stop_gst(proc):
+    """SIGINT the gst child (never SIGKILL: it must shut its libcamera
+    pipeline down cleanly or the ISYS is left holding buffers). Repeat the
+    SIGINT -- historically one is sometimes swallowed during startup.
+    Returns True once it is gone."""
+    if proc.poll() is not None:
+        return True
+    deadline = time.monotonic() + STOP_BUDGET
+    proc.send_signal(signal.SIGINT)
+    next_int = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        if time.monotonic() >= next_int:
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                return True
+            next_int = time.monotonic() + 4.0
+        time.sleep(0.2)
+    return proc.poll() is not None
+
+
+def other_rear_producer():
+    """Pids of processes already driving the rear camera: a real
+    gst-launch with libcamerasrc in its argv, or a v4l2-relayd.
+
+    NOT pgrep -f: that also matches any shell whose command STRING happens
+    to contain the words (a test harness, a grep, a copy-pasted line), and
+    a false positive here would refuse to serve for ever.
+    """
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            argv = open(f"/proc/{entry}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        if not argv or not argv[0]:
+            continue
+        exe = os.path.basename(argv[0])
+        if exe.startswith(b"gst-launch") and \
+                any(a.startswith(b"libcamerasrc") for a in argv[1:]):
+            pids.append(int(entry))
+        elif exe == b"v4l2-relayd":
+            pids.append(int(entry))
+    return pids
+
+
+class SessionOver(Exception):
+    pass
+
+
+# The live producer, if any, so the shutdown path can stop it. A SIGTERM
+# (systemd stop/restart) raises KeyboardInterrupt ANYWHERE, including inside
+# run_session -- if the daemon exited with the child alive, systemd would
+# SIGKILL a gst-launch mid-stream and leave the sensor held.
+CURRENT_PROC = [None]
+
+
+def run_session(out_fd, client_open_t):
+    """Serve one demand session: spawn the producer, relay frames, retry a
+    start that never delivers, stop when every client lets go.
+
+    Returns True if the serve loop should immediately start another session
+    (a client is still attached), False when the camera should go idle.
+    """
+    others = other_rear_producer()
+    if others:
+        log(f"REFUSING to start: another libcamera producer is running "
+            f"(pid {others}) -- is surface-camera-relayd@rear back? retry in 5 s")
+        time.sleep(5.0)
+        count = poll_client_count(out_fd)
+        return count is None or count > 0
+
+    env = dict(os.environ, GST_PLUGIN_PATH=GST_PLUGIN_PATH)
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        log(f"starting producer (attempt {attempt}/{MAX_ATTEMPTS})")
+        proc = subprocess.Popen(GST_CMD, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env=env)
+        CURRENT_PROC[0] = proc
+        pipe = proc.stdout.fileno()
+        os.set_blocking(pipe, False)
+        try:
+            fcntl.fcntl(pipe, 1031, 1 << 20)  # F_SETPIPE_SZ, 1 MiB
+        except OSError:
+            pass
+
+        buf = bytearray()
+        first_frame_t = None
+        frames = 0
+        gone_since = None
+        spawn_t = time.monotonic()
+        next_splash = 0.0
+        try:
+            while True:
+                now = time.monotonic()
+
+                # Watchdog: no first frame in time = a start that hung.
+                if first_frame_t is None and now - spawn_t > FIRST_FRAME_TIMEOUT:
+                    log("no frames from libcamera (stuck start)")
+                    break
+
+                # Splash: keep the waiting client fed with black frames so
+                # its negotiation/first read does not stall or time out.
+                if first_frame_t is None and now >= next_splash:
+                    try:
+                        os.write(out_fd, BLACK_FRAME)
+                    except OSError:
+                        pass
+                    next_splash = now + 1.0 / FPS
+
+                r, _, x = select.select([pipe], [], [out_fd], 0.02)
+
+                if r:
+                    try:
+                        chunk = os.read(pipe, 1 << 20)
+                    except BlockingIOError:
+                        chunk = b""
+                    if chunk == b"" and proc.poll() is not None:
+                        if first_frame_t is None:
+                            log("producer exited before the first frame")
+                            break
+                        raise SessionOver("producer exited")
+                    buf += chunk
+                    while len(buf) >= FRAME_SIZE:
+                        frame = bytes(buf[:FRAME_SIZE])
+                        del buf[:FRAME_SIZE]
+                        frames += 1
+                        if first_frame_t is None:
+                            first_frame_t = time.monotonic()
+                            log(f"first frame: {first_frame_t - spawn_t:.2f} s"
+                                f" after spawn, {first_frame_t - client_open_t:.2f} s"
+                                f" after client open (attempt {attempt})")
+                        try:
+                            os.write(out_fd, frame)
+                        except OSError as exc:
+                            raise SessionOver(f"loopback write failed: {exc}")
+
+                count = poll_client_count(out_fd)
+                if count is not None:
+                    log(f"clients: {count}")
+                    gone_since = None if count else time.monotonic()
+                if gone_since and time.monotonic() - gone_since > CLIENT_GRACE:
+                    raise SessionOver("all clients gone")
+
+        except SessionOver as exc:
+            elapsed = time.monotonic() - (first_frame_t or spawn_t)
+            log(f"session over: {exc} ({frames} frames"
+                + (f", {frames / elapsed:.1f} fps)" if elapsed > 1 else ")"))
+            if not stop_gst(proc):
+                log("FATAL: gst will not die on SIGINT; NOT escalating "
+                    "(kill -9 on a live IPU6 stream wedges it until reboot). "
+                    "Exiting so systemd restarts the daemon.")
+                sys.exit(1)
+            # If the producer died on its own while clients are still
+            # attached, no new client-usage event will fire -- ask the serve
+            # loop to start a fresh session for them.
+            if str(exc) == "producer exited" and gone_since is None:
+                log("client still attached: restarting the pipeline")
+                time.sleep(1.0)
+                return True
+            return False
+
+        # Start that never delivered: SIGINT (a frameless pipeline does die
+        # on it) and try again.
+        if not stop_gst(proc):
+            log("FATAL: stuck gst will not die on SIGINT; exiting (reboot needed)")
+            sys.exit(1)
+        if attempt < MAX_ATTEMPTS:
+            time.sleep(1.0)
+
+    log(f"GIVING UP after {MAX_ATTEMPTS} attempts (libcamera never delivered)")
+    time.sleep(2.0)
+    return False
+
+
+def _terminate(signum, frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def main():
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
+
+    loopback = find_loopback(LOOPBACK_LABEL)
+    if not loopback:
+        sys.exit(f"no v4l2loopback device labelled {LOOPBACK_LABEL!r}")
+
+    out_fd = os.open(loopback, os.O_RDWR)
+    # Once, before any client exists. Never repeat this later: a loopback
+    # with a client attached answers S_FMT with EBUSY, for ever.
+    s_fmt_output(out_fd)
+    s_parm_output(out_fd)
+    # v4l2loopback only advertises CAPTURE once a producer has written
+    # something; without this nothing could open the device and the
+    # client-usage event below would never fire.
+    os.write(out_fd, BLACK_FRAME)
+
+    sub = bytearray(32)
+    struct.pack_into("I", sub, 0, V4L2_EVENT_PRI_CLIENT_USAGE)
+    fcntl.ioctl(out_fd, VIDIOC_SUBSCRIBE_EVENT, sub)
+
+    log(f"serving {loopback} ({W}x{H} YUY2, rear camera via libcamera softISP),"
+        " waiting for clients")
+    try:
+        while True:
+            select.select([], [], [out_fd])
+            if poll_client_count(out_fd):
+                t = time.monotonic()
+                log("client opened")
+                # Bounded restarts: a producer that keeps dying under a
+                # client must not become a spin loop.
+                restarts = []
+                while run_session(out_fd, t):
+                    now = time.monotonic()
+                    restarts = [r for r in restarts if now - r < 60.0]
+                    restarts.append(now)
+                    if len(restarts) > MAX_RESTARTS_PER_MIN:
+                        log(f"GIVING UP: {len(restarts)} pipeline restarts in "
+                            "under a minute; going idle for 10 s. Check the "
+                            "sensor/libcamera (journalctl -u surface-rear-bridge).")
+                        time.sleep(10.0)
+                        break
+                    t = now
+                log("idle")
+    except KeyboardInterrupt as exc:
+        log(f"stopping: {exc}")
+    finally:
+        # Never leave the producer to systemd's final SIGKILL: stop it here,
+        # with SIGINT and patience, before the main process exits. A second
+        # SIGTERM must not abort this teardown, so ignore signals from now on.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        proc = CURRENT_PROC[0]
+        if proc is not None and proc.poll() is None:
+            log("shutting down producer (SIGINT)")
+            if not stop_gst(proc):
+                log("FATAL: producer ignored SIGINT during shutdown; "
+                    "a reboot may be needed (do NOT kill -9 it)")
+
+
+if __name__ == "__main__":
+    main()

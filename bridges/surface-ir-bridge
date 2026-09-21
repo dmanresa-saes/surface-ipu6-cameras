@@ -17,6 +17,7 @@ import fcntl
 import signal
 import mmap
 import os
+import re
 import select
 import struct
 import subprocess
@@ -27,9 +28,38 @@ import numpy as np
 
 IR_W, IR_H = 640, 480
 TARGET_MEAN = 110          # 8-bit target for the exposure loop
+# Fallbacks only: the real range is read off the driver at start-up, because
+# the ov7251 module's vts_boost parameter moves the ceiling (e.g. vts_boost=
+# 3448 gives 15 fps and a 3192-line ceiling instead of 30 fps / 1704).
 EXPOSURE_MIN, EXPOSURE_MAX = 2, 1704   # in lines
 GAIN_MIN, GAIN_MAX = 16, 1023
 DIGITAL_MAX = 6.0          # last resort once the sensor is maxed out
+NOMINAL_FRAME_DT = 1 / 30  # replaced at start-up from the sensor's blanking
+
+# Wedged-start detection. At long VTS (vts_boost) some 20-30% of session
+# starts come up with almost every row pinned at 1023 (top ~44 rows normal),
+# sometimes with garbage frame timing (127-443 fps); it clears on the next
+# session, so detect it on the first frames and restart the session. Also
+# covers the ~3% failure seen at stock timing.
+WEDGE_PROBE_FRAMES = 3     # frames inspected after STREAMON (forwarded, so
+                           # a clean start pays nothing for the check)
+WEDGE_ROW_LEVEL = 1020     # a row whose *minimum* sits here is pinned; real
+                           # scenes never do this (illuminator falloff keeps
+                           # row minima low even at 74% pixel saturation)
+WEDGE_ROW_FRAC = 0.5       # frame is wedged when most rows are pinned
+                           # (measured wedges: >=435/480 rows; clean: 0)
+WEDGE_FAST_DT = 0.4        # frame period under this fraction of nominal is
+                           # the garbage-timing flavour of the same failure
+# Wedged attempts come in streaks (measured: 7 of 10 attempts right after a
+# wedge were wedged again, vs 1-in-3 overall), so retry generously with a
+# small delay, and after WEDGE_RETRIES give up on the boosted timing and fall
+# back to the stock 30 fps vertical blanking for the session -- the wedge
+# rate there is ~3%, and a dimmer working session beats saturated frames.
+WEDGE_RETRIES = 8
+WEDGE_RETRY_DELAY = 0.3    # seconds between restarts, to break the streak
+FALLBACK_RETRIES = 3
+VBLANK_STOCK = 1244        # mainline 30 fps mode: VTS 1724 - 480 lines
+VBLANK_DEF = 1244          # replaced at start-up from the driver
 
 LOOPBACK_LABEL = "Surface IR Camera"
 
@@ -157,6 +187,125 @@ def set_ctrls(subdev, exposure, gain):
               f"{r.stderr.strip()}{r.stdout.strip()}", flush=True)
 
 
+def query_sensor_timing(subdev):
+    """Exposure range and nominal frame period, read off the driver.
+
+    The ov7251 module's vts_boost parameter changes both, so prefer the
+    runtime control ranges to any hardcoded number -- the bridge then works
+    with either module setting.  Frame period = VTS * HTS / pixel_clock,
+    where VTS = height + vertical_blanking and HTS = width + horizontal_
+    blanking (blanking defaults are the mode's nominal timing).
+    """
+    out = subprocess.run(["v4l2-ctl", "-d", subdev, "--list-ctrls"],
+                         capture_output=True, text=True).stdout
+    vals = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(\w+) 0x\w+ \(int(?:64)?\)\s*: min=(-?\d+) "
+                     r"max=(-?\d+) step=\d+ default=(-?\d+) value=(-?\d+)",
+                     line)
+        if m:
+            vals[m.group(1)] = tuple(int(x) for x in m.group(2, 3, 4, 5))
+    emin, emax = EXPOSURE_MIN, EXPOSURE_MAX
+    if "exposure" in vals:
+        emin, emax = vals["exposure"][0], vals["exposure"][1]
+    frame_dt, vblank_def = NOMINAL_FRAME_DT, VBLANK_DEF
+    if "vertical_blanking" in vals and "horizontal_blanking" in vals:
+        pclk = vals.get("pixel_rate", (0, 0, 48000000, 0))[2]
+        vblank_def = vals["vertical_blanking"][2]
+        frame_dt = ((IR_H + vblank_def) *
+                    (IR_W + vals["horizontal_blanking"][2]) / pclk)
+    return emin, emax, vblank_def, frame_dt
+
+
+def frame_is_wedged(img):
+    """True when the frame shows the pinned-rows failure signature.
+
+    Wedged frames have nearly every row entirely at 1023 (row minimum 1023);
+    a genuinely bright scene never does -- the IR illuminator's falloff keeps
+    row minima far below saturation even on frames with 74% of pixels
+    saturated (measured on saved wedged/clean .npy captures: wedges have
+    >= 435 of 480 rows pinned, every clean frame has 0).
+    """
+    rowmin = img.min(axis=1)
+    return float((rowmin >= WEDGE_ROW_LEVEL).mean()) > WEDGE_ROW_FRAC
+
+
+def wedge_probe(cap, nominal_dt):
+    """Inspect the first frames of a session; (frames, why-wedged-or-None).
+
+    The frames are returned so a clean start forwards them instead of
+    dropping them -- the check costs a clean session nothing.  Uses the
+    kernel's capture timestamps, not dequeue times, so a slow consumer
+    cannot fake the garbage-timing signature.
+    """
+    frames, stamps = [], []
+    for _ in range(WEDGE_PROBE_FRAMES):
+        img, ts = cap.frame()
+        if img is None:
+            break
+        frames.append(img)
+        stamps.append(ts)
+    pinned = sum(frame_is_wedged(f) for f in frames)
+    dts = [b - a for a, b in zip(stamps, stamps[1:])]
+    fast = sum(dt < nominal_dt * WEDGE_FAST_DT for dt in dts)
+    if pinned >= 2:
+        return frames, f"{pinned}/{len(frames)} frames with rows pinned at 1023"
+    if fast >= 2 and len(dts) >= 2:
+        pretty = ", ".join(f"{dt * 1e3:.1f}" for dt in dts)
+        return frames, f"absurd frame timing ({pretty} ms between frames)"
+    return frames, None
+
+
+def set_vblank(subdev, vblank):
+    # Separate call, and issued before exposure/gain: the driver recomputes
+    # the exposure control range when vertical blanking changes.
+    subprocess.run(["v4l2-ctl", "-d", subdev, "--set-ctrl",
+                    f"vertical_blanking={vblank}"],
+                   check=False, capture_output=True)
+
+
+def start_capture(entity, subdev, exposure, gain):
+    """Bring the sensor up, restarting the session while it comes up wedged.
+
+    The wedge usually clears on the next session (STREAMOFF, close, reopen,
+    rebuild the media graph), so that is what a retry does.  Wedges streak,
+    hence the pause between restarts.  If the boosted timing stays wedged
+    for WEDGE_RETRIES attempts, fall back to the stock 30 fps blanking for
+    this session; only if even that stays wedged serve as-is -- saturated
+    frames still beat no device, and the next client gets a fresh chance.
+    Returns (capture, probed frames to forward, exposure ceiling).
+    """
+    attempts = [(VBLANK_DEF, EXPOSURE_MAX)] * WEDGE_RETRIES
+    if VBLANK_STOCK < VBLANK_DEF:
+        # exposure_max = height + vblank - margin, so it moves 1:1 with vblank
+        fb_emax = max(EXPOSURE_MAX - (VBLANK_DEF - VBLANK_STOCK),
+                      EXPOSURE_MIN + 1)
+        attempts += [(VBLANK_STOCK, fb_emax)] * FALLBACK_RETRIES
+    last = len(attempts) - 1
+    for i, (vblank, emax) in enumerate(attempts):
+        node, _ = setup_graph(entity)
+        set_vblank(subdev, vblank)
+        set_ctrls(subdev, min(exposure, emax), gain)
+        cap = Capture(node)
+        if i == last:
+            print(f"WEDGE: still wedged after {last} restarts, "
+                  "serving as-is (frames may be saturated)", flush=True)
+            return cap, [], emax
+        nominal = NOMINAL_FRAME_DT * (IR_H + vblank) / (IR_H + VBLANK_DEF)
+        frames, verdict = wedge_probe(cap, nominal)
+        if not verdict:
+            if i:
+                stock = " at stock timing" if vblank != VBLANK_DEF else ""
+                print(f"recovered after {i} restart(s){stock}", flush=True)
+            return cap, frames, emax
+        stock = ", stock timing" if vblank != VBLANK_DEF else ""
+        print(f"wedged session start: {verdict}; "
+              f"restarting sensor session ({i + 1}/{last}{stock})",
+              flush=True)
+        cap.close()
+        time.sleep(WEDGE_RETRY_DELAY)
+
+
 def s_fmt(fd, buf_type, pixfmt, width, height):
     fmt = bytearray(204)
     struct.pack_into("I", fmt, 0, buf_type)
@@ -210,19 +359,21 @@ class Capture:
         fcntl.ioctl(self.fd, VIDIOC_STREAMON, struct.pack("I", BUF_TYPE_CAPTURE))
 
     def frame(self, timeout=2.0):
+        """(image, kernel capture timestamp) or (None, None) on timeout."""
         r, _, _ = select.select([self.fd], [], [], timeout)
         if not r:
-            return None
+            return None, None
         b = bytearray(88)
         struct.pack_into("I", b, 4, BUF_TYPE_CAPTURE)
         struct.pack_into("I", b, 60, MEMORY_MMAP)
         fcntl.ioctl(self.fd, VIDIOC_DQBUF, b)
         idx = struct.unpack_from("I", b, 0)[0]
+        ts_s, ts_us = struct.unpack_from("qq", b, 24)   # struct timeval
         raw = np.frombuffer(self.maps[idx], dtype="<u2",
                             count=self.stride * IR_H)
         img = raw.reshape(IR_H, self.stride)[:, :IR_W].copy()
         fcntl.ioctl(self.fd, VIDIOC_QBUF, b)
-        return img
+        return img, ts_s + ts_us / 1e6
 
     def close(self):
         if self.fd is None:
@@ -245,17 +396,19 @@ def run_session(entity, subdev, out_fd):
     # the libcamera relays for the colour cameras reconfigure the same media
     # device and sever this link. Do NOT re-run S_FMT on the loopback here --
     # once a reader has the format negotiated it answers EBUSY.
-    node, _ = setup_graph(entity)
     exposure, gain, digital = 800, 256, 1.0
     gone_since = None
-    set_ctrls(subdev, exposure, gain)
-    cap = Capture(node)
+    cap, pending, exposure_max = start_capture(entity, subdev, exposure, gain)
+    exposure = min(exposure, exposure_max)
     yuyv = np.empty((IR_H, IR_W, 2), dtype=np.uint8)
     yuyv[..., 1] = 128
     try:
         last_ae = 0.0
         while True:
-            img = cap.frame()
+            if pending:
+                img = pending.pop(0)
+            else:
+                img, _ = cap.frame()
             if img is None:
                 break
 
@@ -296,8 +449,8 @@ def run_session(entity, subdev, out_fd):
                         gain = max(int(gain * factor), GAIN_MIN)
                     elif factor < 1:
                         exposure = max(int(exposure * factor), EXPOSURE_MIN)
-                    elif exposure < EXPOSURE_MAX:
-                        exposure = min(int(exposure * factor), EXPOSURE_MAX)
+                    elif exposure < exposure_max:
+                        exposure = min(int(exposure * factor), exposure_max)
                     elif gain < GAIN_MAX:
                         gain = min(int(gain * factor), GAIN_MAX)
                     else:
@@ -360,8 +513,13 @@ def main():
     subdev, entity = find_subdev("ov7251")
     if not subdev:
         sys.exit("ov7251 has no v4l2 subdev -- driver did not bind")
+    global EXPOSURE_MIN, EXPOSURE_MAX, VBLANK_DEF, NOMINAL_FRAME_DT
+    (EXPOSURE_MIN, EXPOSURE_MAX,
+     VBLANK_DEF, NOMINAL_FRAME_DT) = query_sensor_timing(subdev)
     node, csi = setup_graph(entity)
-    print(f"{entity} ({subdev}) via {csi} -> {node} -> {loopback}", flush=True)
+    print(f"{entity} ({subdev}) via {csi} -> {node} -> {loopback}; "
+          f"exposure {EXPOSURE_MIN}-{EXPOSURE_MAX} lines, "
+          f"nominal {1 / NOMINAL_FRAME_DT:.2f} fps", flush=True)
 
     out_fd = os.open(loopback, os.O_RDWR)
     s_fmt(out_fd, BUF_TYPE_OUTPUT, FMT_YUYV, IR_W, IR_H)
