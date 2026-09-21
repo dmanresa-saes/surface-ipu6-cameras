@@ -1,4 +1,4 @@
-# REPRODUCIR.md — Cámaras Surface Pro 7+ en Linux, de cero
+# REBUILD.es.md — Cámaras Surface Pro 7+ en Linux, de cero
 > **Para quien lee esto (humano o IA):** este fichero es la única fuente necesaria
 > para dejar funcionando las cámaras de un Surface Pro 7+ (front OV5693, trasera
 > OV8865, IR OV7251, IPU6 Tiger Lake PCI 8086:9a19) en una instalación limpia de
@@ -7,9 +7,24 @@
 > calibrado, URLs públicas de lo que hay que descargar, y las trampas conocidas.
 > Ejecutar en orden. Cada sección dice cómo verificarse.
 >
-> Último estado (2026-08-27): frontal PERFECTA (color calibrado contra el tuning
-> OEM de Microsoft, 1280x720@30 binned, verificada en Teams/Chrome), trasera e IR
-> funcionales sin calibrar color, ISP hardware (PSYS) en exploración (sección 10).
+> Último estado (2026-09-22, fin de los trabajos: la máquina se dona): las TRES
+> cámaras en producción, cada una con su puente bajo demanda. Frontal por el ISP
+> hardware del IPU6 (PSYS, sección 10) con el color calibrado contra el tuning
+> OEM de Microsoft (1280x720@30 binned, verificada en Teams/Chrome); trasera por
+> el softISP de libcamera con color calibrado (sección 6.1) y su propio puente
+> bajo demanda (sección 7); IR con el iluminador gobernado por el stream y el
+> modo brillante `vts_boost=3448`.
+>
+> **Antes de aplicar nada de aquí, lee [`MIGRACION.es.md`](MIGRACION.es.md)**:
+> parte de este trabajo ya está upstream o camino de estarlo, y aplicar a ciegas
+> un parche que el árbol ya trae rompe la compilación o duplica lógica. Ese
+> documento es el punto de entrada para una instalación limpia; éste es el
+> playbook detallado con el POR QUÉ de cada pieza.
+>
+> (Los comentarios de los scripts y drivers embebidos aquí se refieren a este
+> documento por su nombre interno, `REPRODUCIR.md`: son literales de los
+> ficheros instalados y se dejan tal cual para que coincidan byte a byte con
+> lo que hay en `bridges/`, `dkms/` y `patches/`.)
 
 ## 0. Requisitos y mapa
 
@@ -64,12 +79,54 @@ print("wrote",dst,len(out),"lines")
 
 ## 2. Driver del sensor frontal OV5693 (DKMS) — LA PIEZA CLAVE
 
-Partir del `drivers/media/i2c/ov5693.c` de mainline v6.19 y aplicar el diff
-embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
+Partir del `drivers/media/i2c/ov5693.c` de mainline v6.19, aplicar PRIMERO la
+serie "media: i2c: Surface Pro 7+ camera flip fixes" v2 de Jakob Berg
+Jespersen (cover msgid `20260729-sp7plus-ov-flips-v2-0-91884b81a8f5@berg.pm`,
+patchwork linux-media serie 28516; sus parches son suyos y no se
+redistribuyen aquí — bájalos de la lista) y aplicar el diff embebido abajo
+encima. Qué hace y POR QUÉ (todo descubierto a base de sangre):
+
+- **Serie flip-fixes (prerequisito, 2026-08-29)**: invierte la polaridad de
+  V4L2_CID_HFLIP (los bits de 0x3821 DES-espejan el readout, que es
+  espejado de nativo — confirmado contra las tablas del driver de Windows:
+  3821=0x1e/0x1f en TODOS los modos) y en el estado HFLIP=1 escribe
+  0x3810=1 para compensar la fase de columna en full-res. CONSECUENCIAS
+  medidas en esta unidad: (a) el perfil HAL pasa de hflip=1 a **hflip=0**
+  (mismo estado de registros que antes de la serie, imagen idéntica);
+  (b) en el modo binned el espejo NO mueve la fase Bayer (el ISP del sensor
+  realinea la ventana de binning, igual que el OV8865), así que nuestro
+  offset X binned se queda en 8 FIJO en ambos estados de flip — un ajuste
+  de paridad ahí (8→9) vuelve magenta el estado HFLIP=1 (probado);
+  (c) en full-res la compensación de la serie deja los DOS estados en fase
+  GBRG (una columna corrida del SBGGR10 que reporta el driver): el estado
+  limpio aquí es el espejado con offset 0, o sea la compensación está en el
+  estado equivocado en esta unidad, y no se puede mover sin más porque el
+  readout des-espejado con offset X=1 no streamea ("Frame sync error"
+  perpetuo). Nada de producción consume full-res, se deja tal cual la
+  serie. Evidencia: capturas raw y la matriz de fases medida en esta unidad
+  (2026-08-29), enviada a la lista en el hilo de la serie.
 
 - **HID ACPI**: mainline solo matchea INT33BE; el Surface enumera OVTI5693.
 - **0x4800=0x2d (MIPI_CTRL00)** en stream-on: sin él, la CSI-2 no engancha
   nunca (línea en negro). Es el fix del PR linux-surface #2171.
+  **SUPERADO UPSTREAM (2026-09)**: la serie v5 de Fernando Rimoli "media:
+  Enable the OV5693 front camera on IPU6 Surface devices" hace esto BIEN —
+  propiedad `clock-noncontinuous` por PCI-ID en `ipu-bridge` (5/7-7/7) + un
+  RMW del BIT(5) de MIPI_CTRL00 en el ov5693 (4/7) — y entró en la rama
+  `next` de media-committers el 2026-09-11. De los bits de 0x2d (0, 2, 3 y
+  5) solo el 5 importa: barrido hecho por Fil Dunsky en una Surface Pro 8,
+  y verificado aquí midiendo que la firma de errores CSI-2 es idéntica con
+  0x2d y con bit-5-solo. Si tu árbol ya trae la serie, usa
+  `patches/ov5693-binned-no-mipictrl.patch` (nuestro binned SIN el 0x4800)
+  en lugar de `patches/ov5693-surface-ipu6.patch`. La CONFIGURACIÓN (binned
+  sin 0x4800, con el gate del bit 5 de la v5) está probada en producción aquí
+  el 2026-09-06 con módulos compilados a mano: PSYS binned 28,7 fps, fase
+  Bayer intacta, 0 errores CSI-2 en raw, rebind sin -EEXIST. El FICHERO de
+  parche es un `git format-patch` rehecho encima de master + v5 1/7 y 4/7,
+  verificado con `git apply --check` y `checkpatch.pl --strict`, pero no
+  compilado en ese árbol exacto. El árbol DKMS de `dkms/ov5693-surface/` sigue llevando el
+  0x2d, que funciona igual (0x2d ⊃ bit 5) pero ya no es lo que va a
+  mainline.
 - **Modo binned 1296x972** (el que usa Windows para 720p/1080p): 2x2 binning =
   4x luz por píxel (2 stops). Sin esto la imagen tiene un ruido brutal
   (ganancia analógica 127 vs 15). Requiere TODO esto a la vez:
@@ -83,7 +140,7 @@ embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
     pipeline lee otra fase.
   * Registros analógicos por modo (3600/3620/21/22, 3708/09, 371f): valores
     extraídos del driver de Windows (ov5693.sys del MSI de Surface, tablas con
-    windows-driver/extract_tables.py del repo ~/camara si está disponible).
+    `tools/extract_tables.py` de este repo).
   * VTS: cap a 30fps en binned (VTS 60fps=1038 no cabe con el PLL binned).
   * **Flip vertical**: en binned solo el bit SENSOR (0x3820 bit1); los dos bits
     a la vez rompen el framing CSI-2, y solo el bit ISP escupe imagen SIN
@@ -91,9 +148,27 @@ embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
 - HTS 2688, VTS base 1984 (matcha Windows binned).
 
 ```diff
---- /tmp/claude-1000/ov5693-mainline.c	2026-08-27 00:05:02.151496465 +0200
-+++ ov5693-fix/ov5693.c	2026-08-26 19:49:11.546795874 +0200
-@@ -110,6 +110,10 @@
+--- a/drivers/media/i2c/ov5693.c	(v6.19 + serie flip-fixes v2)
++++ b/drivers/media/i2c/ov5693.c	(dkms/ov5693-surface)
+@@ -82,6 +82,17 @@
+ #define OV5693_OFFSET_START_X_REG		CCI_REG16(0x3810)
+ #define OV5693_OFFSET_START_Y_REG		CCI_REG16(0x3812)
+ 
++/*
++ * ISP window Y offset used in the binned mode. Parity selects the Bayer
++ * phase of the output: 2 (even) keeps the advertised BGGR phase and is what
++ * libcamera's software ISP expects; 3 (odd, the Windows value) yields the
++ * GRBG phase that the IPU6 PSYS program groups from the Windows tuning
++ * expect. Switch with: modprobe ov5693 binned_y_offset=3
++ */
++static int binned_y_offset = 2;
++module_param(binned_y_offset, int, 0644);
++MODULE_PARM_DESC(binned_y_offset, "binned-mode ISP window Y offset (2=softISP/BGGR, 3=PSYS/GRBG)");
++
+ #define OV5693_SUB_INC_X_REG			CCI_REG8(0x3814)
+ #define OV5693_SUB_INC_Y_REG			CCI_REG8(0x3815)
+ 
+@@ -110,6 +121,10 @@
  #define OV5693_MIN_CROP_WIDTH			2
  #define OV5693_MIN_CROP_HEIGHT			2
  
@@ -104,7 +179,23 @@ embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
  /* Test Pattern */
  #define OV5693_TEST_PATTERN_REG			CCI_REG8(0x5e00)
  #define OV5693_TEST_PATTERN_ENABLE		BIT(7)
-@@ -353,15 +357,36 @@
+@@ -285,6 +300,15 @@
+ 	{CCI_REG8(0x3a04), 0x06},
+ 	{CCI_REG8(0x3a05), 0x14},
+ 	{CCI_REG8(0x3e07), 0x20},
++	/*
++	 * BLC: same values the Windows driver writes. The sensor keeps its
++	 * black pedestal at ~16 LSB (10-bit) at every analogue gain (measured
++	 * with dark captures; adding the remaining Windows BLC registers
++	 * 0x4002/0x4005/0x400c/0x400d/0x404e/0x404f does not change that).
++	 * Note the OEM .aiqb black-level calibration says 64.9 because it is
++	 * expressed at the 12-bit alignment Windows' ISYS DMA delivers
++	 * (16.2 <<2); see REPRODUCIR.md section 10.
++	 */
+ 	{CCI_REG8(0x4000), 0x08},
+ 	{CCI_REG8(0x4001), 0x04},
+ 	{CCI_REG8(0x4004), 0x08},
+@@ -353,21 +377,77 @@
  
  /* V4L2 Controls Functions */
  
@@ -144,7 +235,75 @@ embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
  	if (ret)
  		return ret;
  
-@@ -549,17 +574,73 @@
+ 	return 0;
+ }
+ 
++/*
++ * ISP window X offset. Two things pick the value (all of it measured on a
++ * Surface Pro 7+ front module, phases read from raw captures):
++ *
++ * - The binned mode needs the vendor base of 8 (see ov5693_mode_configure();
++ *   a zero X offset there breaks CSI-2 framing). At full resolution the
++ *   base is 0, and the crop leaves one spare column (crop end = crop start
++ *   + width, inclusive), so a one-column offset always fits.
++ *
++ * - At full resolution this follows the upstream flip-polarity series
++ *   ("media: i2c: Surface Pro 7+ camera flip fixes") verbatim: offset 1 in
++ *   the HFLIP=1 (mirrored, FLIP_HORZ bits cleared) state, 0 otherwise. The
++ *   two flip states then carry the SAME phase, so flipping never changes
++ *   the colours. CAVEAT, measured on this unit: both states decode as GBRG,
++ *   one column off the reported SBGGR10 -- it is the mirrored+offset-0
++ *   state that is SBGGR-clean here, i.e. the compensation sits on the wrong
++ *   state. It cannot simply be moved: the un-mirrored readout refuses to
++ *   stream with a one-column window offset (perpetual "Frame sync error",
++ *   no frames), so an upstream fix needs the crop moved instead. Kept
++ *   as-is to stay register-identical to the upstream series; nothing in
++ *   production consumes the full-resolution mode.
++ *
++ * - In the binned readout the mirror does NOT move the Bayer phase (the
++ *   sensor ISP realigns the binning window, same behaviour as the OV8865),
++ *   so the offset must keep its parity constant: always 8. (A one-column
++ *   parity nudge here was tried and turns the HFLIP=1 state magenta.)
++ */
++static u16 ov5693_offset_start_x(struct ov5693_device *ov5693, bool hflip)
++{
++	if (ov5693->mode.binning_x || ov5693->mode.binning_y)
++		return 8;
++
++	return hflip ? 1 : 0;
++}
++
+ static int ov5693_flip_horz_configure(struct ov5693_device *ov5693,
+ 				      bool enable)
+ {
+@@ -375,7 +455,12 @@
+ 		  OV5693_FORMAT2_FLIP_HORZ_SENSOR_EN;
+ 	int ret;
+ 
+-	/* HFLIP is inverted on this sensor: the FLIP_HORZ bits un-mirror the readout. */
++	/*
++	 * HFLIP is inverted on this sensor: the native readout is mirrored
++	 * and the FLIP_HORZ bits un-mirror it (the init table sets them by
++	 * default, 0x3821 = 0x1e). The vendor (Windows) driver keeps them
++	 * set in every mode table.
++	 */
+ 	ret = cci_update_bits(ov5693->regmap, OV5693_FORMAT2_REG, bits,
+ 			      enable ? 0 : bits, NULL);
+ 	if (ret)
+@@ -383,10 +468,10 @@
+ 
+ 	/*
+ 	 * Clearing the bits shifts the Bayer phase one column off the
+-	 * reported SBGGR10; offset the output window to compensate.
++	 * reported mbus code; offset the output window to compensate.
+ 	 */
+ 	ret = cci_write(ov5693->regmap, OV5693_OFFSET_START_X_REG,
+-			enable ? 1 : 0, NULL);
++			ov5693_offset_start_x(ov5693, enable), NULL);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -559,17 +644,74 @@
  
  /* System Control Functions */
  
@@ -214,14 +373,16 @@ embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
 +	cci_write(ov5693->regmap, OV5693_CROP_START_X_REG,
 +		  binned ? 0 : mode->crop.left, &ret);
  
- 	/* Offset X */
+-	/* Offset X */
 -	cci_write(ov5693->regmap, OV5693_OFFSET_START_X_REG, 0, &ret);
++	/* Offset X: base per mode, parity compensates the HFLIP Bayer shift. */
 +	cci_write(ov5693->regmap, OV5693_OFFSET_START_X_REG,
-+		  binned ? 8 : 0, &ret);
++		  ov5693_offset_start_x(ov5693, ov5693->ctrls.hflip &&
++					ov5693->ctrls.hflip->val), &ret);
  
  	/* Output Size X */
  	cci_write(ov5693->regmap, OV5693_OUTPUT_SIZE_X_REG, mode->format.width,
-@@ -567,18 +648,20 @@
+@@ -577,18 +719,20 @@
  
  	/* Crop End X */
  	cci_write(ov5693->regmap, OV5693_CROP_END_X_REG,
@@ -239,14 +400,15 @@ embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
 +	cci_write(ov5693->regmap, OV5693_CROP_START_Y_REG,
 +		  binned ? 0 : mode->crop.top, &ret);
  
- 	/* Offset Y */
+-	/* Offset Y */
 -	cci_write(ov5693->regmap, OV5693_OFFSET_START_Y_REG, 0, &ret);
++	/* Offset Y: parity picks the Bayer phase, see binned_y_offset. */
 +	cci_write(ov5693->regmap, OV5693_OFFSET_START_Y_REG,
-+		  binned ? 2 : 0, &ret);
++		  binned ? binned_y_offset : 0, &ret);
  
  	/* Output Size Y */
  	cci_write(ov5693->regmap, OV5693_OUTPUT_SIZE_Y_REG, mode->format.height,
-@@ -586,7 +669,8 @@
+@@ -596,7 +740,8 @@
  
  	/* Crop End Y */
  	cci_write(ov5693->regmap, OV5693_CROP_END_Y_REG,
@@ -256,7 +418,7 @@ embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
  
  	/* Subsample X increase */
  	cci_write(ov5693->regmap, OV5693_SUB_INC_X_REG,
-@@ -604,6 +688,24 @@
+@@ -614,6 +759,24 @@
  			OV5693_FORMAT2_HBIN_EN,
  			mode->binning_x ? OV5693_FORMAT2_HBIN_EN : 0, &ret);
  
@@ -281,7 +443,7 @@ embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
  	return ret;
  }
  
-@@ -611,6 +713,18 @@
+@@ -621,6 +784,18 @@
  {
  	int ret = 0;
  
@@ -300,7 +462,7 @@ embebido abajo. Qué hace y POR QUÉ (todo descubierto a base de sangre):
  	cci_write(ov5693->regmap, OV5693_SW_STREAM_REG,
  		  enable ? OV5693_START_STREAMING : OV5693_STOP_STREAMING,
  		  &ret);
-@@ -762,6 +876,16 @@
+@@ -772,6 +947,16 @@
  
  	tgt_fps = rounddown(OV5693_PIXEL_RATE / OV5693_FIXED_PPL / height, 30);
  
@@ -340,11 +502,23 @@ queda sustituido por el de /updates.
 ## 3. Drivers IR (OV7251) e int3472 (DKMS)
 
 **OV7251** (cámara IR, para Howdy o visor): mismo esquema DKMS
-(ov7251-surface). Diff vs mainline v6.19:
+(ov7251-surface). Diff completo vs mainline v6.19 (idéntico a
+`patches/ov7251-surface-ir.patch`; el fichero ya parcheado está en
+`dkms/ov7251-surface/ov7251.c`). Tres bloques: (a) el iluminador IR por la
+salida de strobe del sensor (0x3005 = 0x08 + patrón 0x3b81 = 0xff: el 0xa5
+de la init mainline enciende el LED en frames alternos y saca la mitad
+negros), (b) `V4L2_CID_GAIN` → `V4L2_CID_ANALOGUE_GAIN` (sin esto libcamera
+no enumera el sensor; es el parche de Dan Scally de 2023 nunca mainlineado),
+y (c) las palancas de brillo/estabilidad de 2026-08-29: parámetros de módulo
+`vts_boost` (VTS del modo por defecto; producción usa 3448 = 15 fps y techo
+de exposición 3192 líneas, 1,78x más señal medida) y `win_timing` (el timing
+Windows Hello del ov7251.sys, VTS 522 ≈ 132 fps — NO usar: 2,4x más oscuro),
+el margen de integración ampliado a 256 líneas para el VTS largo y un
+settle de 5 ms tras el software reset de la init:
 
 ```diff
---- /tmp/claude-1000/ov7251-mainline.c	2026-08-27 00:06:13.388214366 +0200
-+++ ov7251-fix/ov7251.c	2026-08-26 00:36:54.851075642 +0200
+--- a/drivers/media/i2c/ov7251.c
++++ b/drivers/media/i2c/ov7251.c
 @@ -23,6 +23,30 @@
  #include <media/v4l2-fwnode.h>
  #include <media/v4l2-subdev.h>
@@ -376,7 +550,267 @@ queda sustituido por el de /updates.
  #define OV7251_SC_MODE_SELECT		0x0100
  #define OV7251_SC_MODE_SELECT_SW_STANDBY	0x0
  #define OV7251_SC_MODE_SELECT_STREAMING		0x1
-@@ -1053,7 +1077,7 @@
+@@ -66,6 +90,14 @@
+ #define OV7251_TIMING_MIN_VTS		1
+ #define OV7251_TIMING_MAX_VTS		0xffff
+ #define OV7251_INTEGRATION_MARGIN	20
++/*
++ * Measured on the Surface Pro 7+ unit: starting a stream with exposure closer
++ * than ~250 lines to VTS intermittently wedges the exposure engine (rows come
++ * out pinned at 1023 for the whole session; ~33% of sessions at VTS-20, 0/16
++ * at VTS-248..448). Keep the mainline margin for the stock modes and use this
++ * safer margin for the long-integration vts_boost mode.
++ */
++#define OV7251_BOOST_INTEGRATION_MARGIN	256
+ 
+ struct reg_value {
+ 	u16 reg;
+@@ -368,6 +400,143 @@
+ 	{ 0x5001, 0x80 },
+ };
+ 
++/*
++ * 640x480 timing as programmed by the Windows vendor driver (ov7251.sys mode
++ * table at VA 0x14001e60c, the IR-illuminated Windows Hello mode: strobe
++ * pattern 0x3b81=0xff and pad-out 0x3005=0x08). Identical to the 30fps table
++ * above except for the pad drive registers (0x3016-0x301c), 0x3664, 0x5000,
++ * VTS 522 (vs 1724) and the PLL1 MIPI divider 0x30b5=0x01 (vs 0x05); the rest
++ * of PLL1 matches the 19.2 MHz / 319.2 MHz link configuration, so this mode
++ * runs the link at 638.4 Mbps with a 63.84 MHz pixel clock: 522 * 928 /
++ * 63.84 MHz = 7.59 ms per frame, ~132 fps. Selected by win_timing=1.
++ */
++static const struct reg_value ov7251_setting_vga_win[] = {
++	{ 0x3005, 0x08 },
++	{ 0x3012, 0xc0 },
++	{ 0x3013, 0xd2 },
++	{ 0x3014, 0x04 },
++	{ 0x3016, 0x10 },
++	{ 0x3017, 0x00 },
++	{ 0x3018, 0x00 },
++	{ 0x301a, 0x00 },
++	{ 0x301b, 0x00 },
++	{ 0x301c, 0x00 },
++	{ 0x3023, 0x05 },
++	{ 0x3037, 0xf0 },
++	{ 0x3106, 0xda },
++	{ 0x3503, 0x07 },
++	{ 0x3509, 0x10 },
++	{ 0x3600, 0x1c },
++	{ 0x3602, 0x62 },
++	{ 0x3620, 0xb7 },
++	{ 0x3622, 0x04 },
++	{ 0x3626, 0x21 },
++	{ 0x3627, 0x30 },
++	{ 0x3630, 0x44 },
++	{ 0x3631, 0x35 },
++	{ 0x3634, 0x60 },
++	{ 0x3636, 0x00 },
++	{ 0x3662, 0x01 },
++	{ 0x3663, 0x70 },
++	{ 0x3664, 0xf0 },
++	{ 0x3666, 0x0a },
++	{ 0x3669, 0x1a },
++	{ 0x366a, 0x00 },
++	{ 0x366b, 0x50 },
++	{ 0x3673, 0x01 },
++	{ 0x3674, 0xff },
++	{ 0x3675, 0x03 },
++	{ 0x3705, 0xc1 },
++	{ 0x3709, 0x40 },
++	{ 0x373c, 0x08 },
++	{ 0x3742, 0x00 },
++	{ 0x3757, 0xb3 },
++	{ 0x3788, 0x00 },
++	{ 0x37a8, 0x01 },
++	{ 0x37a9, 0xc0 },
++	{ 0x3800, 0x00 },
++	{ 0x3801, 0x04 },
++	{ 0x3802, 0x00 },
++	{ 0x3803, 0x04 },
++	{ 0x3804, 0x02 },
++	{ 0x3805, 0x8b },
++	{ 0x3806, 0x01 },
++	{ 0x3807, 0xeb },
++	{ 0x3808, 0x02 }, /* width high */
++	{ 0x3809, 0x80 }, /* width low */
++	{ 0x380a, 0x01 }, /* height high */
++	{ 0x380b, 0xe0 }, /* height low */
++	{ 0x380c, 0x03 }, /* total horiz timing high */
++	{ 0x380d, 0xa0 }, /* total horiz timing low */
++	{ 0x380e, 0x02 }, /* total vertical timing high */
++	{ 0x380f, 0x0a }, /* total vertical timing low */
++	{ 0x3810, 0x00 },
++	{ 0x3811, 0x04 },
++	{ 0x3812, 0x00 },
++	{ 0x3813, 0x05 },
++	{ 0x3814, 0x11 },
++	{ 0x3815, 0x11 },
++	{ 0x3820, 0x40 },
++	{ 0x3821, 0x00 },
++	{ 0x382f, 0x0e },
++	{ 0x3832, 0x00 },
++	{ 0x3833, 0x05 },
++	{ 0x3834, 0x00 },
++	{ 0x3835, 0x0c },
++	{ 0x3837, 0x00 },
++	{ 0x3b80, 0x00 },
++	{ 0x3b81, 0xff },
++	{ 0x3b82, 0x10 },
++	{ 0x3b83, 0x00 },
++	{ 0x3b84, 0x08 },
++	{ 0x3b85, 0x00 },
++	{ 0x3b86, 0x01 },
++	{ 0x3b87, 0x00 },
++	{ 0x3b88, 0x00 },
++	{ 0x3b89, 0x00 },
++	{ 0x3b8a, 0x00 },
++	{ 0x3b8b, 0x05 },
++	{ 0x3b8c, 0x00 },
++	{ 0x3b8d, 0x00 },
++	{ 0x3b8e, 0x00 },
++	{ 0x3b8f, 0x1a },
++	{ 0x3b94, 0x05 },
++	{ 0x3b95, 0xf2 },
++	{ 0x3b96, 0x40 },
++	{ 0x3c00, 0x89 },
++	{ 0x3c01, 0x63 },
++	{ 0x3c02, 0x01 },
++	{ 0x3c03, 0x00 },
++	{ 0x3c04, 0x00 },
++	{ 0x3c05, 0x03 },
++	{ 0x3c06, 0x00 },
++	{ 0x3c07, 0x06 },
++	{ 0x3c0c, 0x01 },
++	{ 0x3c0d, 0xd0 },
++	{ 0x3c0e, 0x02 },
++	{ 0x3c0f, 0x0a },
++	{ 0x4001, 0x42 },
++	{ 0x4004, 0x04 },
++	{ 0x4005, 0x00 },
++	{ 0x404e, 0x01 },
++	{ 0x4300, 0xff },
++	{ 0x4301, 0x00 },
++	{ 0x4501, 0x48 },
++	{ 0x4600, 0x00 },
++	{ 0x4601, 0x4e },
++	{ 0x4801, 0x0f },
++	{ 0x4806, 0x0f },
++	{ 0x4819, 0xaa },
++	{ 0x4823, 0x3e },
++	{ 0x4837, 0x19 },
++	{ 0x4a0d, 0x00 },
++	{ 0x4a47, 0x7f },
++	{ 0x4a49, 0xf0 },
++	{ 0x4a4b, 0x30 },
++	{ 0x5000, 0x87 },
++	{ 0x5001, 0x80 },
++};
++
+ static const struct reg_value ov7251_setting_vga_60fps[] = {
+ 	{ 0x3005, 0x00 },
+ 	{ 0x3012, 0xc0 },
+@@ -624,6 +793,26 @@
+ 	{ 0x5001, 0x80 },
+ };
+ 
++static int win_timing;
++module_param(win_timing, int, 0444);
++MODULE_PARM_DESC(win_timing,
++		 "Use the Windows vendor driver 640x480 timing (VTS 522, 638.4 Mbps link, ~132 fps) instead of the default 30 fps mode");
++
++/*
++ * Brightness lever, measured on the Surface Pro 7+ unit: with the IR strobe
++ * lighting the whole integration window, mean signal is linear in exposure
++ * lines (19.33 us/line at the 240 MHz link), so the only way to a brighter
++ * frame is a higher exposure ceiling, which is VTS-bound. Raising the default
++ * mode's VTS trades frame rate for ceiling: 3448 -> 15 fps / 66 ms max
++ * integration (2x today's), 6896 -> 7.5 fps / 4x. Ignored if win_timing=1.
++ * The consumer must also ask for the longer exposure (surface-ir-bridge
++ * clamps at its own EXPOSURE_MAX).
++ */
++static int vts_boost;
++module_param(vts_boost, int, 0444);
++MODULE_PARM_DESC(vts_boost,
++		 "Override default 640x480 mode VTS (1724 = 30 fps; larger = slower + higher exposure ceiling; 0 = off)");
++
+ static const unsigned long supported_xclk_rates[] = {
+ 	[OV7251_19_2_MHZ] = 19200000,
+ 	[OV7251_24_MHZ] = 24000000,
+@@ -639,7 +828,10 @@
+ 	[OV7251_LINK_FREQ_319_2_MHZ] = 63840000,
+ };
+ 
+-static const struct ov7251_mode_info ov7251_mode_info_data[] = {
++/*
++ * Not const: entry 0 is replaced by ov7251_win_mode when win_timing=1.
++ */
++static struct ov7251_mode_info ov7251_mode_info_data[] = {
+ 	{
+ 		.width = 640,
+ 		.height = 480,
+@@ -681,6 +873,21 @@
+ 	},
+ };
+ 
++/* Windows vendor timing, substituted for entry 0 above when win_timing=1. */
++static const struct ov7251_mode_info ov7251_win_mode = {
++	.width = 640,
++	.height = 480,
++	.vts = 522,
++	.data = ov7251_setting_vga_win,
++	.data_size = ARRAY_SIZE(ov7251_setting_vga_win),
++	.exposure_max = 502,
++	.exposure_def = 400,
++	.timeperframe = {
++		.numerator = 100,
++		.denominator = 13179
++	}
++};
++
+ static int ov7251_regulators_enable(struct ov7251 *ov7251)
+ {
+ 	int ret;
+@@ -831,7 +1038,12 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/*
++	 * The Windows vendor timing runs the PLL1 of the 319.2 MHz link
++	 * configuration but with the MIPI divider at 0x01 instead of 0x05.
++	 */
+ 	ret = ov7251_write_reg(ov7251, OV7251_PLL1_MIPI_DIV_REG,
++			       win_timing ? 0x01 :
+ 			       configs->pll1[ov7251->link_freq_idx]->mipi_div);
+ 	if (ret < 0)
+ 		return ret;
+@@ -942,6 +1154,15 @@
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Global init issues a software reset (0x0103); give it time to settle
++	 * before s_stream starts writing the PLL and mode registers, which can
++	 * happen microseconds after this returns (pm_runtime resume path).
++	 * Without this, sessions intermittently start with the exposure engine
++	 * wedged (rows pinned at full scale, sometimes garbage frame timing).
++	 */
++	usleep_range(5000, 6000);
++
+ 	return ret;
+ }
+ 
+@@ -1035,7 +1256,9 @@
+ 		int exposure_max;
+ 
+ 		exposure_max = ov7251->current_mode->height + ctrl->val -
+-			       OV7251_INTEGRATION_MARGIN;
++			       (vts_boost && !win_timing ?
++				OV7251_BOOST_INTEGRATION_MARGIN :
++				OV7251_INTEGRATION_MARGIN);
+ 		__v4l2_ctrl_modify_range(ov7251->exposure,
+ 					 ov7251->exposure->minimum,
+ 					 exposure_max,
+@@ -1053,7 +1276,7 @@
  	case V4L2_CID_EXPOSURE:
  		ret = ov7251_set_exposure(ov7251, ctrl->val);
  		break;
@@ -385,7 +819,7 @@ queda sustituido por el de /updates.
  		ret = ov7251_set_gain(ov7251, ctrl->val);
  		break;
  	case V4L2_CID_TEST_PATTERN:
-@@ -1334,6 +1358,36 @@
+@@ -1334,6 +1557,36 @@
  	return 0;
  }
  
@@ -422,7 +856,7 @@ queda sustituido por el de /updates.
  static int ov7251_s_stream(struct v4l2_subdev *subdev, int enable)
  {
  	struct ov7251 *ov7251 = to_ov7251(subdev);
-@@ -1372,7 +1426,13 @@
+@@ -1372,7 +1625,13 @@
  				       OV7251_SC_MODE_SELECT_STREAMING);
  		if (ret)
  			goto err_power_down;
@@ -436,7 +870,7 @@ queda sustituido por el de /updates.
  		ret = ov7251_write_reg(ov7251, OV7251_SC_MODE_SELECT,
  				       OV7251_SC_MODE_SELECT_SW_STANDBY);
  		pm_runtime_put(ov7251->dev);
-@@ -1579,7 +1639,7 @@
+@@ -1579,7 +1838,7 @@
  	ov7251->exposure = v4l2_ctrl_new_std(&ov7251->ctrls, &ov7251_ctrl_ops,
  					     V4L2_CID_EXPOSURE, 1, 32, 1, 32);
  	ov7251->gain = v4l2_ctrl_new_std(&ov7251->ctrls, &ov7251_ctrl_ops,
@@ -445,6 +879,37 @@ queda sustituido por el de /updates.
  	v4l2_ctrl_new_std_menu_items(&ov7251->ctrls, &ov7251_ctrl_ops,
  				     V4L2_CID_TEST_PATTERN,
  				     ARRAY_SIZE(ov7251_test_pattern_menu) - 1,
+@@ -1644,6 +1903,30 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (win_timing) {
++		/*
++		 * The Windows timing runs the sensor's 319.2 MHz link PLL
++		 * (with the MIPI divider tweak in ov7251_pll_configure), so
++		 * report that link frequency regardless of what the fwnode
++		 * advertised: the IPU6 CSI-2 receiver reads the rate from the
++		 * sensor's LINK_FREQ control at stream time.
++		 */
++		ov7251->link_freq_idx = OV7251_LINK_FREQ_319_2_MHZ;
++		ov7251_mode_info_data[0] = ov7251_win_mode;
++		dev_info(dev, "win_timing=1: Windows vendor 640x480 timing (VTS 522, 638.4 Mbps)\n");
++	} else if (vts_boost > 522 && vts_boost <= OV7251_TIMING_MAX_VTS) {
++		struct ov7251_mode_info *mode = &ov7251_mode_info_data[0];
++
++		mode->vts = vts_boost;
++		mode->exposure_max = vts_boost - OV7251_BOOST_INTEGRATION_MARGIN;
++		/* 30 fps at the stock VTS of 1724, scaled down from there */
++		mode->timeperframe.denominator = (3000u * 1724) / vts_boost;
++		dev_info(dev, "vts_boost=%d: default mode at %u.%02u fps, exposure ceiling %u lines\n",
++			 vts_boost, mode->timeperframe.denominator / 100,
++			 mode->timeperframe.denominator % 100,
++			 mode->exposure_max);
++	}
++
+ 	/* get system clock (xclk) */
+ 	ov7251->xclk = devm_v4l2_sensor_clk_get(dev, NULL);
+ 	if (IS_ERR(ov7251->xclk))
 ```
 
 **int3472** (el glue ACPI de alimentación de los sensores): parche necesario
@@ -463,7 +928,7 @@ módulo `ov8865_pwr1_con_id` como override opcional del con_id de POWER1
 POWER1 mapea a "dvdd". El int3472 solo enumera su sensor EN EL ARRANQUE:
 cada prueba = reiniciar. Diff vs mainline v6.19
 (drivers/platform/x86/intel/int3472/; también en
-publish/surface-ipu6-cameras/patches/int3472-surface-sensors.patch):
+`patches/int3472-surface-sensors.patch` de este repo):
 
 ```diff
 --- a/drivers/platform/x86/intel/int3472/discrete.c
@@ -764,7 +1229,7 @@ algorithms:
   # Surface Pro 7+ driver MSI; the advanced-color-matrix record stores, per
   # illuminant (A/F4/F11/F2/D50/D65/D75), the sensor white point as R/G,B/G
   # chromaticity. Gains are the reciprocals; CT comes from the record's CIE
-  # coordinates (McCamy). See w11-ref/aiqb-real/decode_aiqb.py.
+  # coordinates (McCamy). See tools/decode_aiqb.py.
   # The whole curve is then scaled per-channel (r x1.20, b x1.08 net) to this
   # PHYSICAL unit, anchored on a white wall under the room's ceiling light,
   # matched to how the Windows stack renders the same wall (G/R=0.965,
@@ -930,6 +1395,21 @@ bien (stats a ~2,5 fps, AGC sin converger en 10 s) y vblank=3769 (33 ms)
 directamente rompe el sensor (frames planos). Queda como pendiente (sección
 11); el tuning de color es independiente de esto.
 
+**Flip fixes (2026-08-29)**: la trasera corre con el ov8865 de la serie
+"media: i2c: Surface Pro 7+ camera flip fixes" v2 (patchwork linux-media
+28516, [1/2] ov8865: polaridad de HFLIP invertida; es SU parche, aquí no se
+redistribuye), compilado out-of-tree e instalado en
+`/lib/modules/$(uname -r)/updates/ov8865.ko` (una actualización de kernel lo
+revierte en silencio al mainline hasta que la serie llegue via stable — está
+Cc: stable). Medido en raw: en el OV8865 los flips NO mueven la fase Bayer
+(BGGR en h0v0/h1v0/h1v1, binned 1632x1224 y full 3264x2448), así que la
+CALIBRACIÓN DE COLOR NO SE TOCA con o sin la serie. Lo que sí cambia es la
+geometría final: libcamera sigue pidiendo hflip=1+vflip=1 (rotación SSDB
+180°) y con la polaridad corregida eso da ahora la rotación 180° VERDADERA
+(verificado raw: h1v1 = rotación exacta de h0v0); antes de la serie la
+trasera salía espejada horizontalmente. Con el mainline la trasera sigue
+funcionando igual que siempre (espejada), solo cambia el espejo.
+
 ## 7. El puente: scripts y unidades systemd
 
 `/usr/local/bin/surface-camera-loopbacks`:
@@ -953,10 +1433,18 @@ add 81 "Surface IR Camera"
 add 82 "Surface Rear Camera"
 ```
 
-`/usr/local/bin/surface-camera-relayd` (SOLO rear desde 2026-08-27: la
-frontal pasó al ISP hardware con `surface-psys-bridge`, sección 10; el script
-conserva el caso front por si hay que volver al softISP a mano — requiere
-recargar ov5693 con binned_y_offset=2, ver sección 10):
+`/usr/local/bin/surface-camera-relayd` — **HISTÓRICO desde 2026-08-30**: ni
+front ni rear lo usan ya. La frontal pasó al ISP hardware
+(`surface-psys-bridge`, sección 10) el 2026-08-27 y la trasera pasó a
+`surface-rear-bridge` (bajo demanda, misma forma que los otros dos puentes) el
+2026-08-30. Motivo medido: v4l2-relayd mantiene su pipeline de splash
+(`videotestsrc`) corriendo SIEMPRE, tenga o no cliente — 7 h de "reposo"
+costaron ~20 % de CPU y **3,3 GB de RSS** con el sensor SUSPENDIDO todo el
+rato (buffers acumulándose contra un loopback que nadie leía). El script y su
+unidad plantilla se conservan (deshabilitados) por si hay que volver al
+softISP a mano; el caso front además requiere recargar ov5693 con
+binned_y_offset=2, ver sección 10. La cadena gst de la rama `rear` se
+reutiliza **literalmente** en `surface-rear-bridge`:
 ```bash
 #!/bin/bash
 # On-demand bridge: a Surface Pro 7+ colour camera -> v4l2loopback, via
@@ -1089,6 +1577,7 @@ import fcntl
 import signal
 import mmap
 import os
+import re
 import select
 import struct
 import subprocess
@@ -1099,9 +1588,38 @@ import numpy as np
 
 IR_W, IR_H = 640, 480
 TARGET_MEAN = 110          # 8-bit target for the exposure loop
+# Fallbacks only: the real range is read off the driver at start-up, because
+# the ov7251 module's vts_boost parameter moves the ceiling (e.g. vts_boost=
+# 3448 gives 15 fps and a 3192-line ceiling instead of 30 fps / 1704).
 EXPOSURE_MIN, EXPOSURE_MAX = 2, 1704   # in lines
 GAIN_MIN, GAIN_MAX = 16, 1023
 DIGITAL_MAX = 6.0          # last resort once the sensor is maxed out
+NOMINAL_FRAME_DT = 1 / 30  # replaced at start-up from the sensor's blanking
+
+# Wedged-start detection. At long VTS (vts_boost) some 20-30% of session
+# starts come up with almost every row pinned at 1023 (top ~44 rows normal),
+# sometimes with garbage frame timing (127-443 fps); it clears on the next
+# session, so detect it on the first frames and restart the session. Also
+# covers the ~3% failure seen at stock timing.
+WEDGE_PROBE_FRAMES = 3     # frames inspected after STREAMON (forwarded, so
+                           # a clean start pays nothing for the check)
+WEDGE_ROW_LEVEL = 1020     # a row whose *minimum* sits here is pinned; real
+                           # scenes never do this (illuminator falloff keeps
+                           # row minima low even at 74% pixel saturation)
+WEDGE_ROW_FRAC = 0.5       # frame is wedged when most rows are pinned
+                           # (measured wedges: >=435/480 rows; clean: 0)
+WEDGE_FAST_DT = 0.4        # frame period under this fraction of nominal is
+                           # the garbage-timing flavour of the same failure
+# Wedged attempts come in streaks (measured: 7 of 10 attempts right after a
+# wedge were wedged again, vs 1-in-3 overall), so retry generously with a
+# small delay, and after WEDGE_RETRIES give up on the boosted timing and fall
+# back to the stock 30 fps vertical blanking for the session -- the wedge
+# rate there is ~3%, and a dimmer working session beats saturated frames.
+WEDGE_RETRIES = 8
+WEDGE_RETRY_DELAY = 0.3    # seconds between restarts, to break the streak
+FALLBACK_RETRIES = 3
+VBLANK_STOCK = 1244        # mainline 30 fps mode: VTS 1724 - 480 lines
+VBLANK_DEF = 1244          # replaced at start-up from the driver
 
 LOOPBACK_LABEL = "Surface IR Camera"
 
@@ -1229,6 +1747,125 @@ def set_ctrls(subdev, exposure, gain):
               f"{r.stderr.strip()}{r.stdout.strip()}", flush=True)
 
 
+def query_sensor_timing(subdev):
+    """Exposure range and nominal frame period, read off the driver.
+
+    The ov7251 module's vts_boost parameter changes both, so prefer the
+    runtime control ranges to any hardcoded number -- the bridge then works
+    with either module setting.  Frame period = VTS * HTS / pixel_clock,
+    where VTS = height + vertical_blanking and HTS = width + horizontal_
+    blanking (blanking defaults are the mode's nominal timing).
+    """
+    out = subprocess.run(["v4l2-ctl", "-d", subdev, "--list-ctrls"],
+                         capture_output=True, text=True).stdout
+    vals = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(\w+) 0x\w+ \(int(?:64)?\)\s*: min=(-?\d+) "
+                     r"max=(-?\d+) step=\d+ default=(-?\d+) value=(-?\d+)",
+                     line)
+        if m:
+            vals[m.group(1)] = tuple(int(x) for x in m.group(2, 3, 4, 5))
+    emin, emax = EXPOSURE_MIN, EXPOSURE_MAX
+    if "exposure" in vals:
+        emin, emax = vals["exposure"][0], vals["exposure"][1]
+    frame_dt, vblank_def = NOMINAL_FRAME_DT, VBLANK_DEF
+    if "vertical_blanking" in vals and "horizontal_blanking" in vals:
+        pclk = vals.get("pixel_rate", (0, 0, 48000000, 0))[2]
+        vblank_def = vals["vertical_blanking"][2]
+        frame_dt = ((IR_H + vblank_def) *
+                    (IR_W + vals["horizontal_blanking"][2]) / pclk)
+    return emin, emax, vblank_def, frame_dt
+
+
+def frame_is_wedged(img):
+    """True when the frame shows the pinned-rows failure signature.
+
+    Wedged frames have nearly every row entirely at 1023 (row minimum 1023);
+    a genuinely bright scene never does -- the IR illuminator's falloff keeps
+    row minima far below saturation even on frames with 74% of pixels
+    saturated (measured on saved wedged/clean .npy captures: wedges have
+    >= 435 of 480 rows pinned, every clean frame has 0).
+    """
+    rowmin = img.min(axis=1)
+    return float((rowmin >= WEDGE_ROW_LEVEL).mean()) > WEDGE_ROW_FRAC
+
+
+def wedge_probe(cap, nominal_dt):
+    """Inspect the first frames of a session; (frames, why-wedged-or-None).
+
+    The frames are returned so a clean start forwards them instead of
+    dropping them -- the check costs a clean session nothing.  Uses the
+    kernel's capture timestamps, not dequeue times, so a slow consumer
+    cannot fake the garbage-timing signature.
+    """
+    frames, stamps = [], []
+    for _ in range(WEDGE_PROBE_FRAMES):
+        img, ts = cap.frame()
+        if img is None:
+            break
+        frames.append(img)
+        stamps.append(ts)
+    pinned = sum(frame_is_wedged(f) for f in frames)
+    dts = [b - a for a, b in zip(stamps, stamps[1:])]
+    fast = sum(dt < nominal_dt * WEDGE_FAST_DT for dt in dts)
+    if pinned >= 2:
+        return frames, f"{pinned}/{len(frames)} frames with rows pinned at 1023"
+    if fast >= 2 and len(dts) >= 2:
+        pretty = ", ".join(f"{dt * 1e3:.1f}" for dt in dts)
+        return frames, f"absurd frame timing ({pretty} ms between frames)"
+    return frames, None
+
+
+def set_vblank(subdev, vblank):
+    # Separate call, and issued before exposure/gain: the driver recomputes
+    # the exposure control range when vertical blanking changes.
+    subprocess.run(["v4l2-ctl", "-d", subdev, "--set-ctrl",
+                    f"vertical_blanking={vblank}"],
+                   check=False, capture_output=True)
+
+
+def start_capture(entity, subdev, exposure, gain):
+    """Bring the sensor up, restarting the session while it comes up wedged.
+
+    The wedge usually clears on the next session (STREAMOFF, close, reopen,
+    rebuild the media graph), so that is what a retry does.  Wedges streak,
+    hence the pause between restarts.  If the boosted timing stays wedged
+    for WEDGE_RETRIES attempts, fall back to the stock 30 fps blanking for
+    this session; only if even that stays wedged serve as-is -- saturated
+    frames still beat no device, and the next client gets a fresh chance.
+    Returns (capture, probed frames to forward, exposure ceiling).
+    """
+    attempts = [(VBLANK_DEF, EXPOSURE_MAX)] * WEDGE_RETRIES
+    if VBLANK_STOCK < VBLANK_DEF:
+        # exposure_max = height + vblank - margin, so it moves 1:1 with vblank
+        fb_emax = max(EXPOSURE_MAX - (VBLANK_DEF - VBLANK_STOCK),
+                      EXPOSURE_MIN + 1)
+        attempts += [(VBLANK_STOCK, fb_emax)] * FALLBACK_RETRIES
+    last = len(attempts) - 1
+    for i, (vblank, emax) in enumerate(attempts):
+        node, _ = setup_graph(entity)
+        set_vblank(subdev, vblank)
+        set_ctrls(subdev, min(exposure, emax), gain)
+        cap = Capture(node)
+        if i == last:
+            print(f"WEDGE: still wedged after {last} restarts, "
+                  "serving as-is (frames may be saturated)", flush=True)
+            return cap, [], emax
+        nominal = NOMINAL_FRAME_DT * (IR_H + vblank) / (IR_H + VBLANK_DEF)
+        frames, verdict = wedge_probe(cap, nominal)
+        if not verdict:
+            if i:
+                stock = " at stock timing" if vblank != VBLANK_DEF else ""
+                print(f"recovered after {i} restart(s){stock}", flush=True)
+            return cap, frames, emax
+        stock = ", stock timing" if vblank != VBLANK_DEF else ""
+        print(f"wedged session start: {verdict}; "
+              f"restarting sensor session ({i + 1}/{last}{stock})",
+              flush=True)
+        cap.close()
+        time.sleep(WEDGE_RETRY_DELAY)
+
+
 def s_fmt(fd, buf_type, pixfmt, width, height):
     fmt = bytearray(204)
     struct.pack_into("I", fmt, 0, buf_type)
@@ -1282,19 +1919,21 @@ class Capture:
         fcntl.ioctl(self.fd, VIDIOC_STREAMON, struct.pack("I", BUF_TYPE_CAPTURE))
 
     def frame(self, timeout=2.0):
+        """(image, kernel capture timestamp) or (None, None) on timeout."""
         r, _, _ = select.select([self.fd], [], [], timeout)
         if not r:
-            return None
+            return None, None
         b = bytearray(88)
         struct.pack_into("I", b, 4, BUF_TYPE_CAPTURE)
         struct.pack_into("I", b, 60, MEMORY_MMAP)
         fcntl.ioctl(self.fd, VIDIOC_DQBUF, b)
         idx = struct.unpack_from("I", b, 0)[0]
+        ts_s, ts_us = struct.unpack_from("qq", b, 24)   # struct timeval
         raw = np.frombuffer(self.maps[idx], dtype="<u2",
                             count=self.stride * IR_H)
         img = raw.reshape(IR_H, self.stride)[:, :IR_W].copy()
         fcntl.ioctl(self.fd, VIDIOC_QBUF, b)
-        return img
+        return img, ts_s + ts_us / 1e6
 
     def close(self):
         if self.fd is None:
@@ -1317,17 +1956,19 @@ def run_session(entity, subdev, out_fd):
     # the libcamera relays for the colour cameras reconfigure the same media
     # device and sever this link. Do NOT re-run S_FMT on the loopback here --
     # once a reader has the format negotiated it answers EBUSY.
-    node, _ = setup_graph(entity)
     exposure, gain, digital = 800, 256, 1.0
     gone_since = None
-    set_ctrls(subdev, exposure, gain)
-    cap = Capture(node)
+    cap, pending, exposure_max = start_capture(entity, subdev, exposure, gain)
+    exposure = min(exposure, exposure_max)
     yuyv = np.empty((IR_H, IR_W, 2), dtype=np.uint8)
     yuyv[..., 1] = 128
     try:
         last_ae = 0.0
         while True:
-            img = cap.frame()
+            if pending:
+                img = pending.pop(0)
+            else:
+                img, _ = cap.frame()
             if img is None:
                 break
 
@@ -1368,8 +2009,8 @@ def run_session(entity, subdev, out_fd):
                         gain = max(int(gain * factor), GAIN_MIN)
                     elif factor < 1:
                         exposure = max(int(exposure * factor), EXPOSURE_MIN)
-                    elif exposure < EXPOSURE_MAX:
-                        exposure = min(int(exposure * factor), EXPOSURE_MAX)
+                    elif exposure < exposure_max:
+                        exposure = min(int(exposure * factor), exposure_max)
                     elif gain < GAIN_MAX:
                         gain = min(int(gain * factor), GAIN_MAX)
                     else:
@@ -1432,8 +2073,13 @@ def main():
     subdev, entity = find_subdev("ov7251")
     if not subdev:
         sys.exit("ov7251 has no v4l2 subdev -- driver did not bind")
+    global EXPOSURE_MIN, EXPOSURE_MAX, VBLANK_DEF, NOMINAL_FRAME_DT
+    (EXPOSURE_MIN, EXPOSURE_MAX,
+     VBLANK_DEF, NOMINAL_FRAME_DT) = query_sensor_timing(subdev)
     node, csi = setup_graph(entity)
-    print(f"{entity} ({subdev}) via {csi} -> {node} -> {loopback}", flush=True)
+    print(f"{entity} ({subdev}) via {csi} -> {node} -> {loopback}; "
+          f"exposure {EXPOSURE_MIN}-{EXPOSURE_MAX} lines, "
+          f"nominal {1 / NOMINAL_FRAME_DT:.2f} fps", flush=True)
 
     out_fd = os.open(loopback, os.O_RDWR)
     s_fmt(out_fd, BUF_TYPE_OUTPUT, FMT_YUYV, IR_W, IR_H)
@@ -1503,8 +2149,28 @@ ExecStart=/usr/local/bin/surface-camera-loopbacks
 [Install]
 WantedBy=multi-user.target
 
-# surface-camera-relayd@.service  (instancia en uso: rear; front existe pero
-# esta deshabilitada desde que la frontal va por surface-psys-bridge, s.10)
+# surface-rear-bridge.service  (la trasera, bajo demanda, desde 2026-08-30)
+[Unit]
+Description=Surface rear camera bridge (OV8865 libcamera softISP -> v4l2loopback)
+Requires=surface-camera-loopbacks.service
+After=surface-camera-loopbacks.service
+Conflicts=surface-camera-relayd@rear.service
+
+[Service]
+Type=simple
+Environment=REAR_BRIDGE_DEBUG=
+ExecStart=/usr/local/bin/surface-rear-bridge
+Restart=always
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+
+# surface-camera-relayd@.service  (HISTÓRICO: ninguna instancia habilitada
+# desde 2026-08-30; front va por surface-psys-bridge s.10 y rear por
+# surface-rear-bridge. Se conserva para volver al softISP a mano.)
 [Unit]
 Description=Surface %i camera relay (libcamera -> v4l2loopback)
 Requires=surface-camera-loopbacks.service
@@ -1537,10 +2203,423 @@ WantedBy=multi-user.target
 ```
 
 Habilitar: `systemctl enable --now surface-camera-loopbacks
-surface-camera-relayd@rear surface-ir-bridge surface-psys-bridge`
-(la unidad `surface-psys-bridge` está en la sección 10;
-`surface-camera-relayd@front` queda DESHABILITADA — la frontal es del puente
-PSYS, y su unit lleva `Conflicts=surface-camera-relayd@front.service`).
+surface-rear-bridge surface-ir-bridge surface-psys-bridge`
+(la unidad `surface-psys-bridge` está en la sección 10). **Ninguna instancia
+de `surface-camera-relayd@` queda habilitada**: la frontal es del puente PSYS
+y la trasera de `surface-rear-bridge`; ambas unidades llevan el `Conflicts=`
+correspondiente para que un arranque manual del relayd no meta un segundo
+productor en el mismo loopback.
+
+`/usr/local/bin/surface-rear-bridge` (python; fuente en
+`bridges/surface-rear-bridge` de este repo) es una copia estructural de
+`surface-psys-bridge`: posee el fd productor del loopback, hace el `S_FMT`
+YUY2 1280x720 **una sola vez antes de que exista ningún cliente** (con un
+cliente enganchado el loopback responde EBUSY para siempre, y
+`v4l2loopback-ctl set-caps` haría que el nodo anunciara CAPTURE a todos y
+ningún productor pudiera abrirlo), se suscribe a
+`V4L2_EVENT_PRI_CLIENT_USAGE` y sólo entonces lanza el `gst-launch-1.0` con
+la cadena de la rama `rear` de arriba terminada en `fdsink fd=1`. Alimenta
+frames negros de splash hasta el primer frame real, para el hijo con SIGINT
+(nunca KILL) tras `CLIENT_GRACE = 3 s` sin clientes, y reintenta (3 intentos
+por sesión, máx. 5 reinicios/minuto con cliente vivo). Medido 2026-08-30:
+reposo 0,000 % CPU y ~15 MB de RSS estable (frente a 20 % / 3,3 GB del
+relayd), sensor `suspended`; con cliente ~30 fps y 0,31 s hasta el primer
+frame real.
+
+Completo (`bridges/surface-rear-bridge`):
+
+```python
+#!/usr/bin/env python3
+"""Surface Pro 7+ REAR camera (OV8865) -> v4l2loopback, on demand.
+
+Producer pipeline (root): libcamerasrc (software ISP) -> RGB 1596x896 ->
+crop 2 px -> scale 1280x720 -> YUY2 -> fdsink; this daemon owns the
+loopback producer fd and relays the frames to /dev/video82.
+
+Why this replaces v4l2-relayd (design decision, 2026-08-30):
+ - v4l2-relayd runs its splash pipeline for ever, whether or not anybody
+   has the loopback open. Measured 2026-08-29: 7 h of "idle" cost ~20 %
+   of a CPU and 3.3 GB RSS with the sensor SUSPENDED the whole time --
+   the entire bill was videotestsrc feeding a loopback nobody read, with
+   buffers piling up inside the relay.
+ - Same on-demand shape as surface-psys-bridge (front) and
+   surface-ir-bridge (IR): nothing runs until a client opens the device.
+
+The gst element chain below is NOT a style choice; every piece fixes a
+measured bug and must be kept verbatim (see REPRODUCIR.md s.4/s.6):
+ - render 1596x896: the software ISP emits black frames when asked for
+   less than ~1296 px wide off a full-resolution readout, and the GPU
+   resampler lays magenta rows / a dark column at 1600/1920 wide. 1596 is
+   the width with none of that.
+ - videocrop 2 px all round: the debayer's border rows/columns carry an
+   incomplete Bayer phase and come out magenta after the CCM.
+ - videorate skip-to-first=true: without it the first frame is repeated
+   for every "missing" slot since the pipeline clock started = a picture
+   frozen for seconds ("camera frozen" bug).
+ - the loopback is written by THIS process, never by a v4l2sink, and its
+   format is set ONCE here before any client exists: S_FMT on a loopback
+   a client has already negotiated loops on EBUSY, and
+   `v4l2loopback-ctl set-caps` makes the device advertise CAPTURE to
+   everyone so no producer can open it for output again.
+"""
+
+import fcntl
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+W, H, FPS = 1280, 720, 30
+FRAME_SIZE = W * H * 2
+LOOPBACK_LABEL = "Surface Rear Camera"
+CAM_ID = r"\\_SB_.PC00.I2C3.CAMR"   # gst_parse_launch eats one backslash level
+GST_PLUGIN_PATH = "/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0"
+
+GST_CMD = [
+    "gst-launch-1.0", "-q",
+    "libcamerasrc", f"camera-name={CAM_ID}", "!",
+    "video/x-raw,width=1596,height=896", "!",
+    "videocrop", "top=2", "left=2", "right=2", "bottom=2", "!",
+    "videoscale", "!",
+    "videorate", "skip-to-first=true", "!",
+    f"video/x-raw,width={W},height={H},framerate={FPS}/1", "!",
+    "videoconvert", "!",
+    "video/x-raw,format=YUY2", "!",
+    "fdsink", "fd=1",
+]
+
+# A good start delivers its first frame in ~2-4 s (libcamera has to bring up
+# the sensor, the ISYS and an EGL context). 20 s separates that cleanly from
+# a start that will never deliver.
+FIRST_FRAME_TIMEOUT = 20.0
+MAX_ATTEMPTS = 3
+# How long every client has to be gone before the camera is shut down.
+# Doubles as a linger window: players open/probe/close/reopen, and a
+# reopen inside the grace reuses the running pipeline (first frame is then
+# immediate instead of paying the ~2 s libcamera start again).
+CLIENT_GRACE = 3.0
+# SIGINT-and-wait budget for the gst child.
+STOP_BUDGET = 20.0
+# A producer that keeps dying under a live client must not spin.
+MAX_RESTARTS_PER_MIN = 5
+
+# --- v4l2 ioctls (same layouts as surface-psys-bridge) ----------------------
+VIDIOC_S_FMT = 0xC0D05605
+VIDIOC_S_PARM = 0xC0CC5616
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565A
+VIDIOC_DQEVENT = 0x80885659  # struct v4l2_event is 136 bytes; wrong size => ENOTTY
+BUF_TYPE_OUTPUT = 2
+FMT_YUYV = 0x56595559
+# v4l2loopback signals this when the number of capturing clients changes.
+V4L2_EVENT_PRI_CLIENT_USAGE = 0x08000000 + 0x08E00000 + 1
+
+DEBUG = os.environ.get("REAR_BRIDGE_DEBUG")
+
+# Black in YUY2: Y=16, U=V=128 (video range).
+BLACK_FRAME = bytes([16, 128]) * (W * H)
+
+
+def log(msg):
+    print(f"[{time.monotonic():.3f}] {msg}", flush=True)
+
+
+def find_loopback(label):
+    for name in sorted(os.listdir("/sys/devices/virtual/video4linux")):
+        try:
+            path = f"/sys/devices/virtual/video4linux/{name}/name"
+            if open(path).read().strip() == label:
+                return "/dev/" + name
+        except OSError:
+            pass
+    return None
+
+
+def s_fmt_output(fd):
+    fmt = bytearray(204)
+    struct.pack_into("I", fmt, 0, BUF_TYPE_OUTPUT)
+    struct.pack_into("IIII", fmt, 8, W, H, FMT_YUYV, 1)
+    fcntl.ioctl(fd, VIDIOC_S_FMT, fmt)
+
+
+def s_parm_output(fd):
+    """Advertise 30 fps (v4l2_outputparm.timeperframe = 1/30)."""
+    parm = bytearray(204)
+    struct.pack_into("I", parm, 0, BUF_TYPE_OUTPUT)
+    struct.pack_into("II", parm, 4, 0x1000, 0)   # capability=TIMEPERFRAME, outputmode
+    struct.pack_into("II", parm, 12, 1, FPS)     # timeperframe num/den
+    try:
+        fcntl.ioctl(fd, VIDIOC_S_PARM, parm)
+    except OSError as exc:
+        log(f"S_PARM failed ({exc}); fps stays at the loopback default")
+
+
+def poll_client_count(fd):
+    """Newest capture-client count, or None if unchanged. POLLPRI = the
+    THIRD list select() returns; reading the first one misses every event."""
+    count = None
+    while True:
+        _, _, x = select.select([], [], [fd], 0)
+        if not x:
+            return count
+        ev = bytearray(136)
+        try:
+            fcntl.ioctl(fd, VIDIOC_DQEVENT, ev)
+        except OSError:
+            return count
+        if struct.unpack_from("I", ev, 0)[0] == V4L2_EVENT_PRI_CLIENT_USAGE:
+            count = struct.unpack_from("I", ev, 8)[0]
+
+
+def stop_gst(proc):
+    """SIGINT the gst child (never SIGKILL: it must shut its libcamera
+    pipeline down cleanly or the ISYS is left holding buffers). Repeat the
+    SIGINT -- historically one is sometimes swallowed during startup.
+    Returns True once it is gone."""
+    if proc.poll() is not None:
+        return True
+    deadline = time.monotonic() + STOP_BUDGET
+    proc.send_signal(signal.SIGINT)
+    next_int = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        if time.monotonic() >= next_int:
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                return True
+            next_int = time.monotonic() + 4.0
+        time.sleep(0.2)
+    return proc.poll() is not None
+
+
+def other_rear_producer():
+    """Pids of processes already driving the rear camera: a real
+    gst-launch with libcamerasrc in its argv, or a v4l2-relayd.
+
+    NOT pgrep -f: that also matches any shell whose command STRING happens
+    to contain the words (a test harness, a grep, a copy-pasted line), and
+    a false positive here would refuse to serve for ever.
+    """
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            argv = open(f"/proc/{entry}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        if not argv or not argv[0]:
+            continue
+        exe = os.path.basename(argv[0])
+        if exe.startswith(b"gst-launch") and \
+                any(a.startswith(b"libcamerasrc") for a in argv[1:]):
+            pids.append(int(entry))
+        elif exe == b"v4l2-relayd":
+            pids.append(int(entry))
+    return pids
+
+
+class SessionOver(Exception):
+    pass
+
+
+# The live producer, if any, so the shutdown path can stop it. A SIGTERM
+# (systemd stop/restart) raises KeyboardInterrupt ANYWHERE, including inside
+# run_session -- if the daemon exited with the child alive, systemd would
+# SIGKILL a gst-launch mid-stream and leave the sensor held.
+CURRENT_PROC = [None]
+
+
+def run_session(out_fd, client_open_t):
+    """Serve one demand session: spawn the producer, relay frames, retry a
+    start that never delivers, stop when every client lets go.
+
+    Returns True if the serve loop should immediately start another session
+    (a client is still attached), False when the camera should go idle.
+    """
+    others = other_rear_producer()
+    if others:
+        log(f"REFUSING to start: another libcamera producer is running "
+            f"(pid {others}) -- is surface-camera-relayd@rear back? retry in 5 s")
+        time.sleep(5.0)
+        count = poll_client_count(out_fd)
+        return count is None or count > 0
+
+    env = dict(os.environ, GST_PLUGIN_PATH=GST_PLUGIN_PATH)
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        log(f"starting producer (attempt {attempt}/{MAX_ATTEMPTS})")
+        proc = subprocess.Popen(GST_CMD, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env=env)
+        CURRENT_PROC[0] = proc
+        pipe = proc.stdout.fileno()
+        os.set_blocking(pipe, False)
+        try:
+            fcntl.fcntl(pipe, 1031, 1 << 20)  # F_SETPIPE_SZ, 1 MiB
+        except OSError:
+            pass
+
+        buf = bytearray()
+        first_frame_t = None
+        frames = 0
+        gone_since = None
+        spawn_t = time.monotonic()
+        next_splash = 0.0
+        try:
+            while True:
+                now = time.monotonic()
+
+                # Watchdog: no first frame in time = a start that hung.
+                if first_frame_t is None and now - spawn_t > FIRST_FRAME_TIMEOUT:
+                    log("no frames from libcamera (stuck start)")
+                    break
+
+                # Splash: keep the waiting client fed with black frames so
+                # its negotiation/first read does not stall or time out.
+                if first_frame_t is None and now >= next_splash:
+                    try:
+                        os.write(out_fd, BLACK_FRAME)
+                    except OSError:
+                        pass
+                    next_splash = now + 1.0 / FPS
+
+                r, _, x = select.select([pipe], [], [out_fd], 0.02)
+
+                if r:
+                    try:
+                        chunk = os.read(pipe, 1 << 20)
+                    except BlockingIOError:
+                        chunk = b""
+                    if chunk == b"" and proc.poll() is not None:
+                        if first_frame_t is None:
+                            log("producer exited before the first frame")
+                            break
+                        raise SessionOver("producer exited")
+                    buf += chunk
+                    while len(buf) >= FRAME_SIZE:
+                        frame = bytes(buf[:FRAME_SIZE])
+                        del buf[:FRAME_SIZE]
+                        frames += 1
+                        if first_frame_t is None:
+                            first_frame_t = time.monotonic()
+                            log(f"first frame: {first_frame_t - spawn_t:.2f} s"
+                                f" after spawn, {first_frame_t - client_open_t:.2f} s"
+                                f" after client open (attempt {attempt})")
+                        try:
+                            os.write(out_fd, frame)
+                        except OSError as exc:
+                            raise SessionOver(f"loopback write failed: {exc}")
+
+                count = poll_client_count(out_fd)
+                if count is not None:
+                    log(f"clients: {count}")
+                    gone_since = None if count else time.monotonic()
+                if gone_since and time.monotonic() - gone_since > CLIENT_GRACE:
+                    raise SessionOver("all clients gone")
+
+        except SessionOver as exc:
+            elapsed = time.monotonic() - (first_frame_t or spawn_t)
+            log(f"session over: {exc} ({frames} frames"
+                + (f", {frames / elapsed:.1f} fps)" if elapsed > 1 else ")"))
+            if not stop_gst(proc):
+                log("FATAL: gst will not die on SIGINT; NOT escalating "
+                    "(kill -9 on a live IPU6 stream wedges it until reboot). "
+                    "Exiting so systemd restarts the daemon.")
+                sys.exit(1)
+            # If the producer died on its own while clients are still
+            # attached, no new client-usage event will fire -- ask the serve
+            # loop to start a fresh session for them.
+            if str(exc) == "producer exited" and gone_since is None:
+                log("client still attached: restarting the pipeline")
+                time.sleep(1.0)
+                return True
+            return False
+
+        # Start that never delivered: SIGINT (a frameless pipeline does die
+        # on it) and try again.
+        if not stop_gst(proc):
+            log("FATAL: stuck gst will not die on SIGINT; exiting (reboot needed)")
+            sys.exit(1)
+        if attempt < MAX_ATTEMPTS:
+            time.sleep(1.0)
+
+    log(f"GIVING UP after {MAX_ATTEMPTS} attempts (libcamera never delivered)")
+    time.sleep(2.0)
+    return False
+
+
+def _terminate(signum, frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def main():
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
+
+    loopback = find_loopback(LOOPBACK_LABEL)
+    if not loopback:
+        sys.exit(f"no v4l2loopback device labelled {LOOPBACK_LABEL!r}")
+
+    out_fd = os.open(loopback, os.O_RDWR)
+    # Once, before any client exists. Never repeat this later: a loopback
+    # with a client attached answers S_FMT with EBUSY, for ever.
+    s_fmt_output(out_fd)
+    s_parm_output(out_fd)
+    # v4l2loopback only advertises CAPTURE once a producer has written
+    # something; without this nothing could open the device and the
+    # client-usage event below would never fire.
+    os.write(out_fd, BLACK_FRAME)
+
+    sub = bytearray(32)
+    struct.pack_into("I", sub, 0, V4L2_EVENT_PRI_CLIENT_USAGE)
+    fcntl.ioctl(out_fd, VIDIOC_SUBSCRIBE_EVENT, sub)
+
+    log(f"serving {loopback} ({W}x{H} YUY2, rear camera via libcamera softISP),"
+        " waiting for clients")
+    try:
+        while True:
+            select.select([], [], [out_fd])
+            if poll_client_count(out_fd):
+                t = time.monotonic()
+                log("client opened")
+                # Bounded restarts: a producer that keeps dying under a
+                # client must not become a spin loop.
+                restarts = []
+                while run_session(out_fd, t):
+                    now = time.monotonic()
+                    restarts = [r for r in restarts if now - r < 60.0]
+                    restarts.append(now)
+                    if len(restarts) > MAX_RESTARTS_PER_MIN:
+                        log(f"GIVING UP: {len(restarts)} pipeline restarts in "
+                            "under a minute; going idle for 10 s. Check the "
+                            "sensor/libcamera (journalctl -u surface-rear-bridge).")
+                        time.sleep(10.0)
+                        break
+                    t = now
+                log("idle")
+    except KeyboardInterrupt as exc:
+        log(f"stopping: {exc}")
+    finally:
+        # Never leave the producer to systemd's final SIGKILL: stop it here,
+        # with SIGINT and patience, before the main process exits. A second
+        # SIGTERM must not abort this teardown, so ignore signals from now on.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        proc = CURRENT_PROC[0]
+        if proc is not None and proc.poll() is None:
+            log("shutting down producer (SIGINT)")
+            if not stop_gst(proc):
+                log("FATAL: producer ignored SIGINT during shutdown; "
+                    "a reboot may be needed (do NOT kill -9 it)")
+
+
+if __name__ == "__main__":
+    main()
+```
 
 ## 8. Verificación
 
@@ -1678,12 +2757,13 @@ el camino de producción de la frontal: /dev/video80 lo sirve
 
 ### 10.1 Módulo psys como DKMS (`ipu6-psys-surface/1.0`)
 
-Instalador y fuentes en `ipu6-userspace/dkms/` (dkms.conf + Makefile
+Instalador y fuentes en `dkms/ipu6-psys-surface/` (dkms.conf + Makefile
 envoltorio + dkms_install.sh); el repo de Intel clonado en
-`ipu6-userspace/ipu6-drivers/` y los headers mainline en
-`ipu6-userspace/mainline-ipu6-headers/`. Instalar:
+un checkout propio de `intel/ipu6-drivers` (el instalador lo clona) y los
+headers mainline en `dkms/ipu6-psys-surface/mainline-ipu6-headers/`.
+Instalar:
 
-    cd camara/ipu6-userspace/dkms && sudo ./dkms_install.sh
+    cd dkms/ipu6-psys-surface && sudo ./dkms_install.sh
 
 El script monta `/usr/src/ipu6-psys-surface-1.0/` con: `psys/` (fuentes) bajo
 `drivers/media/pci/intel/ipu6/`, los `.h` de sus dos directorios padre,
@@ -1694,7 +2774,7 @@ modules-load.d. Prerequisito por kernel: `include/generated/autoconf.h`
 (gen_autoconf.py, sección 1). Verificado: `srcversion` del .ko DKMS idéntico
 al .ko validado a mano (mismas fuentes, commit 71bddb5 del repo).
 
-`ipu6-userspace/dkms/dkms.conf`:
+`dkms/ipu6-psys-surface/dkms.conf`:
 ```
 PACKAGE_NAME="ipu6-psys-surface"
 PACKAGE_VERSION="1.0"
@@ -1711,7 +2791,7 @@ MAKE[0]="make -C ${BUILD_DIR} KDIR=${kernel_source_dir} modules"
 CLEAN="make -C ${BUILD_DIR} KDIR=${kernel_source_dir} clean"
 ```
 
-`ipu6-userspace/dkms/Makefile` (envoltorio; el orden de los -I IMPORTA:
+`dkms/ipu6-psys-surface/Makefile` (envoltorio; el orden de los -I IMPORTA:
 ml-hdrs primero para tapar los headers homónimos del árbol de Intel):
 ```make
 KDIR ?= /lib/modules/$(shell uname -r)/build
@@ -1726,7 +2806,7 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(PSYS) clean
 ```
 
-`ipu6-userspace/dkms/dkms_install.sh` (completo):
+`dkms/ipu6-psys-surface/dkms_install.sh` (completo):
 ```bash
 #!/bin/bash
 # Instala el modulo PSYS del IPU6 como paquete DKMS "ipu6-psys-surface/1.0".
@@ -1740,8 +2820,8 @@ clean:
 #    del propio repo de Intel.
 #
 # Prerequisito (una vez por kernel): linux-headers-surface no trae
-# include/generated/autoconf.h; generarlo con ov5693-fix/gen_autoconf.py
-# (ver ov5693-fix/README.md).
+# include/generated/autoconf.h; generarlo con tools/gen_autoconf.py
+# (ver dkms/README.md).
 set -e
 HERE=$(dirname "$(readlink -f "$0")")
 REPO=${REPO:-$HERE/../ipu6-drivers}
@@ -1756,7 +2836,7 @@ SRC=/usr/src/ipu6-psys-surface-1.0
 KVER=$(uname -r)
 [ -e "/usr/src/linux-headers-$KVER/include/generated/autoconf.h" ] || {
     echo "falta include/generated/autoconf.h en los headers de $KVER;" >&2
-    echo "generarlo primero: sudo python3 ov5693-fix/gen_autoconf.py \\" >&2
+    echo "generarlo primero: sudo python3 tools/gen_autoconf.py \\" >&2
     echo "  /boot/config-$KVER /usr/src/linux-headers-$KVER/include/generated/autoconf.h" >&2
     exit 1
 }
@@ -1798,6 +2878,24 @@ echo "OK: modulo instalado; cargara en el arranque (alias auxiliary + modules-lo
 options ov5693 binned_y_offset=1
 ```
 
+`/etc/modprobe.d/ov7251-surface.conf`:
+```
+# IR mas brillante (1.78x): VTS 3448 -> 15 fps, techo de exposicion 3192
+# lineas (61,7 ms). OJO: un % de STREAMONs (3-50%, deriva con las horas,
+# INDEPENDIENTE del VTS) arranca colgado -- es el D-PHY del IPU6, no el
+# sensor (ver seccion 11); surface-ir-bridge lo detecta y reintenta
+# (0,5-2 s extra), con fallback a vblank stock tras 8 intentos. Quitar esta
+# linea = volver a 30 fps stock (el bridge lee los rangos del driver en
+# runtime, no hay que tocarlo). Params del driver DKMS ov7251-surface:
+# vts_boost (VTS del modo), win_timing (timing Windows Hello 99fps, NO
+# usar: 2.4x mas oscuro).
+options ov7251 vts_boost=3448
+```
+
+OJO recarga de ov7251: `rmmod` dice in-use por el ISYS; primero
+`echo i2c-INT347E:00 | sudo tee /sys/bus/i2c/drivers/ov7251/unbind`,
+luego rmmod/modprobe (con servicios de camara parados).
+
 CONSECUENCIA: la frontal es PSYS-only. Cualquier uso de la frontal vía
 libcamera (cam/qcam/libcamerasrc, o rehabilitar surface-camera-relayd@front)
 saldrá MAGENTA con este default (libcamera cree BGGR, la fase real con
@@ -1818,7 +2916,7 @@ como SUBPROCESO y usa exactamente la mecánica validada de psys-test.sh:
 SIGINT (repetido) y ciclo de ov5693.
 
 - Daemon: `/usr/local/bin/surface-psys-bridge` (python, fuente en
-  `camara/bridge/surface-psys-bridge`, embebido abajo). Es el ÚNICO productor
+  `bridges/surface-psys-bridge` de este repo, embebido abajo). Es el ÚNICO productor
   del loopback: mantiene abierto /dev/video80 (S_FMT OUTPUT YUYV 1280x720 +
   S_PARM 30fps + un frame negro para que anuncie CAPTURE), espera el evento
   client-usage de v4l2loopback (POLLPRI, tercera lista de select), y por
@@ -2264,13 +3362,14 @@ if __name__ == "__main__":
      ./autogen.sh; ./configure --prefix=/usr; make; make install`. Instala el
      plugin en /usr/lib/gstreamer-1.0: symlink a
      /usr/lib/x86_64-linux-gnu/gstreamer-1.0/ o gst no lo ve.
-  4. **Config del ov5693** (ficheros en reproducir-src/ y aiqb-real/ del repo):
-     * /etc/camera/ipu6/sensors/ov5693-uf.xml (perfil mediaCfg=1; el de
-       reproducir-src incluye ya los controles de flip y NV12).
+  4. **Config del ov5693** (el perfil está en `config/ov5693-uf.xml` de este
+     repo; el .aiqb lo extraes tú del MSI, no se redistribuye):
+     * /etc/camera/ipu6/sensors/ov5693-uf.xml = `config/ov5693-uf.xml`
+       (perfil mediaCfg=1, ya con los controles de flip y NV12).
      * /etc/camera/ipu6/OV5693_MSHW0220_TGL.aiqb: el del MSI pero con el
-       black level reescalado a 10 bits (aiqb-real/patch_aiqb_blc.py, o
-       copiar aiqb-real/OV5693_MSHW0220_TGL_bl10.aiqb); el original tal
-       cual da dominante verde (ver "COLOR ... CAUSA Y FIX" abajo).
+       black level reescalado a 10 bits (`tools/patch_aiqb_blc.py`); el
+       original tal cual da dominante verde (ver "COLOR ... CAUSA Y FIX"
+       abajo).
      * /etc/camera/ipu6/gcss/graph_settings_ov5693.xml = el
        graph_settings_ov5693_13P2BA540_BIN_TGL.xml del MSI TAL CUAL (en GRBG;
        NO cambiar a BGGR: la fase real de nuestros datos ES GRBG, medido en
@@ -2302,13 +3401,13 @@ if __name__ == "__main__":
     son identicos a los de Windows, 0x4009=0x10). El AIC aplica el 64.9 tal
     cual sobre datos 4x mas pequenos.
   * FIX: reescalar el black level del .aiqb /4 (64.9 -> 16.2) con
-    w11-ref/aiqb-real/patch_aiqb_blc.py (parcha records 3 y 31 y recalcula
+    `tools/patch_aiqb_blc.py` (parcha records 3 y 31 y recalcula
     los DOS checksums de cabecera: 0x4c = suma u32 auto-excluyente de la
     seccion AIQB [0x38,0x38+size@0x3c), y despues 0x14 = suma u32
     auto-excluyente del fichero entero; sin ellos el CCA rechaza el fichero:
     "initIntelCcaHandle, init IntelCca fails"). Instalado:
     /etc/camera/ipu6/OV5693_MSHW0220_TGL.aiqb = version parcheada
-    (OV5693_MSHW0220_TGL_bl10.aiqb; original en .aiqb.orig y en aiqb-real/).
+    (OV5693_MSHW0220_TGL_bl10.aiqb; guarda el original como .aiqb.orig).
   * Resultado: AWB estima CCT 4784 y white point (0.649,0.623) = D50 del
     .aiqb, coherente con la luz real; pared neutra en la salida (R/G
     1.03-1.11, B/G 0.93-0.97, misma calidez que el softISP calibrado),
@@ -2317,10 +3416,16 @@ if __name__ == "__main__":
   * OJO trasera: el OV8865_MSHW0221_TGL.aiqb tendra el mismo desajuste;
     aplicar el mismo reescalado /4 cuando se monte su pipeline PSYS (validar
     antes su pedestal real con capturas a oscuras).
-- ORIENTACION PSYS (RESUELTA 2026-08-27): combinacion ganadora
-  **vflip=1 + hflip=1 en el perfil HAL + binned_y_offset=1 en el driver**
+- ORIENTACION PSYS (RESUELTA 2026-08-27; ACTUALIZADA 2026-08-29 tras la
+  serie flip-fixes): combinacion ganadora
+  **vflip=1 + hflip=0 en el perfil HAL + binned_y_offset=1 en el driver**
   -> imagen derecha, mismo espejo que el softISP, fase GRBG intacta (sin
-  magenta). Hallazgos empiricos que matizan el algebra de fase:
+  magenta). OJO: hasta 2026-08-29 era hflip=1; la serie "Surface Pro 7+
+  camera flip fixes" invierte la polaridad de HFLIP, asi que hflip=0 pide
+  ahora EXACTAMENTE el mismo estado de registros (bits 0x3821 puestos,
+  offset X binned 8) que antes pedia hflip=1. Verificado con captura de
+  produccion por /dev/video80: misma orientacion y color que la linea base
+  pre-serie. Hallazgos empiricos que matizan el algebra de fase:
   * En binned el vflip (solo bit SENSOR de 0x3820) NO conmuta la fase de
     fila: v1+o2 dio la misma fase BGGR que v0+o2 (magenta bajo el HAL GRBG).
     La paridad del offset sigue mandando: impar = GRBG tambien con vflip=1.
@@ -2376,7 +3481,7 @@ Objetivo: menos grano que produce el pipeline PSYS en poca luz vs W11.
 Protocolo: escena fija, parche plano oscuro 32x32 (x=1232,y=672), sigma
 temporal DETRENDED (se resta la media del parche por frame: la deriva de luz
 contamina sigma_t si no) + sigma espacial + Y + ag del log (cameraDebug=0xff).
-Evidencia: scratchpad noise-levers/ (jpgs+logs). Resumen de medidas (30
+Evidencia: capturas y logs de la sesión (no publicados). Resumen de medidas (30
 frames, misma escena, la luz derivó entre runs — comparar por ag):
 
     config                       sigma_t  sigma_s   Y    ag     t(ms)
@@ -2413,7 +3518,7 @@ frames, misma escena, la luz derivó entre runs — comparar por ag):
   nr-mode/nr-level (gst-inspect: no hay propiedad NR; el HAL sí tiene
   setNrMode/setNrLevel pero no hay camino desde gst-launch).
 - PALANCA 3 (subir fuerza NR en el .aiqb): estructura LISP descifrada del
-  todo (ver aiqb-structure-notes.md y w11-ref/aiqb-real/lisp_explore.py):
+  todo (ver `tools/lisp_explore.py`):
   sub-records {n1,n2,npts, eje1 f32*n1, eje2 f32*n2, valores i32*n1*n2*npts};
   el algoritmo uuid 28866 (stream 60001) es el NR bayer funcional: sus
   umbrales suben monótonos con el eje de ganancia [1,2,4,8,15.88]
@@ -2439,9 +3544,66 @@ ver 10.x/notas). Vías futuras NO acotadas: (a) descifrar el record AE nid
   exposición, x3 de señal verificado en raw) requiere que el softISP/AGC lo
   digiera; hoy desestabiliza el pipeline (ver sección 6.1). Alternativa: el
   camino PSYS de abajo.
-- IR más brillante: portar PLL (30b0-30b5, 3098-309b) y VTS (522 vs 1724) del
-  ov7251.sys de Windows.
-- Publicar todo en GitHub (borradores primero; cuenta dmanresa-saes).
+- IR más brillante: HECHO 2026-08-29 (2ª pasada): `vts_boost=3448` ACTIVADO
+  en producción (1,78x más brillo medido, 15 fps) + detect-and-restart en el
+  bridge: cuelgue = >50% de filas con mínimo >=1020 (calibrado: un frame
+  legítimamente saturado al 73% da 0 filas clavadas — el falloff del
+  iluminador siempre deja mínimos bajos) o >=2 gaps entre frames <0,4x el
+  período nominal (timestamps de DQBUF). Recuperación: STREAMOFF + reabrir +
+  rehacer grafo, pausa 0,3 s (los cuelgues van en racha), fallback a vblank
+  stock tras 8 intentos. Validado 20/20 sesiones buenas (6 cuelgues
+  recuperados). AGC sin cambios (paso a reloj de pared). EXPOSURE_MAX ahora
+  se lee del driver en runtime.
+
+  CAUSA RAÍZ del cuelgue IDENTIFICADA (2026-08-29, 3ª pasada) — NO es el
+  sensor ni el VTS: es el **D-PHY del receptor CSI-2 del IPU6** que se
+  desincroniza al arrancar el stream. Solo las sesiones colgadas emiten
+  `csi2-5 error: DPHY fatal error / SOT sync error / Frame sync error` desde
+  el primer frame; las "filas a 1023" son basura del receptor (hay valores
+  >1023, imposibles en Y10 real) y el pacing absurdo (6-190 fps) es tráfico
+  mal decodificado. La correlación con VTS era ARTEFACTO de medida: misma
+  tasa a VTS 1724 y 3448, pero deriva con las horas (~3% mañana, 25-35%
+  tarde, ~50% noche) y en rachas. Matriz probada, todo NULO: 0x3C01=0xAB
+  (low-power engine), 0x3C0E/F=VTS, delays pre-stream, hs_zero/clk_zero/
+  hs_prepare/clk_prepare, 0x4837, 0x4800, exposición, PM forzado, link
+  638,4 Mbps de Windows. Pruebas por manipulación: (1) la init del MCD PHY
+  corre en cada STREAMON ANTES de alimentar el sensor (el ov7251 enciende
+  por runtime-PM dentro de su s_stream, después del enable del subdev CSI2),
+  o sea el PHY se inicializa contra lanes sin excitar; (2) PHY1 es COMPARTIDO
+  ov5693(port 4)+ov7251(port 5) con refcount: con la frontal streaming la
+  init del IR se salta y cuelga 22/22 = 100%; con la trasera (PHY0) tasa
+  normal; (3) dejar el sensor transmitiendo entre sesiones: 29/30 fallos;
+  (4) forzar hs_prepare extremo (0x4802=0x80, 0x4827>=0x32) reproduce la
+  firma idéntica al 100%. Además en TGL los timings que calcula
+  `ipu6_isys_csi2_calc_timing()` SE IGNORAN: `ipu6_isys_mcd_phy_set_power()`
+  descarta el argumento de timing (solo el PHY de JSL lo usa); TGL va por
+  tablas estáticas por PPI. Arreglo correcto = lado receptor en el kernel
+  (detectar la ráfaga DPHY-fatal/SOT tras stream-on y reinicializar PHY +
+  reiniciar la fuente), justo lo que hace nuestro retry desde userspace.
+  Driver revertido byte-idéntico al backup; versión instrumentada guardada
+  en ov7251.c.wedge-diag-params (params lp_normal, basefrm_sync, poke,
+  spoke, prestream_delay_us, keep_streaming) para la conversación upstream.
+  Harnesses y logs: material de sesión, no publicado. ENVIADO a linux-media
+  el 2026-08-29 como bug report ("intermittent D-PHY desync at stream start
+  (TGL)"), sin arreglo en el kernel a día de hoy: el retry del puente es lo
+  único que hay.
+
+  Historia previa del análisis:
+  (INVESTIGADO 2026-08-29, callejón sin salida el port de
+  Windows) El modo Windows Hello del ov7251.sys es VTS 522 ≈ 99 fps con solo
+  9,7 ms de integración máx (vs 32,9 ms nuestro; PLL solo cambia el divisor
+  MIPI, pclk 48 MHz idéntico): portado y estable por IPU6 pero 2,4x MÁS
+  OSCURO a ganancia igual. La palanca real es alargar el frame: parámetro
+  `vts_boost` en el DKMS (p.ej. 3448 → 15 fps, 1,8-1,9x más brillo; 6 fps →
+  3,4x). NO activado en producción: con VTS largo ~20-30% de arranques de
+  sesión salen colgados (filas a 1023, misma familia que el vblank de la
+  OV8865); se cura reabriendo sesión. Para probar: `options ov7251
+  vts_boost=3448` + subir EXPOSURE_MAX del bridge al máx del control, y
+  haría falta detect-and-restart de frames blancos en el bridge para que
+  sea usable. `win_timing` y `vts_boost` default 0 = comportamiento previo.
+  Evidencia: medidas de brillo IR de la sesión (no publicadas).
+- (HECHO 2026-08-27) Publicado en
+  https://github.com/dmanresa-saes/surface-ipu6-cameras (este repo).
 - (HECHO 2026-08-27) Userspace PSYS: en producción para la frontal
   (sección 10: DKMS + modprobe.d + surface-psys-bridge).
 - PSYS para la trasera (OV8865): mismo camino, pendiente perfil HAL propio y
