@@ -127,9 +127,17 @@ encima. Qué hace y POR QUÉ (todo descubierto a base de sangre):
   compilado en ese árbol exacto. El árbol DKMS de `dkms/ov5693-surface/` sigue llevando el
   0x2d, que funciona igual (0x2d ⊃ bit 5) pero ya no es lo que va a
   mainline.
-- **Modo binned 1296x972** (el que usa Windows para 720p/1080p): 2x2 binning =
-  4x luz por píxel (2 stops). Sin esto la imagen tiene un ruido brutal
-  (ganancia analógica 127 vs 15). Requiere TODO esto a la vez:
+- **Modo binned 1296x972** (el que usa Windows para 720p/1080p). Lo que gana,
+  medido: el binning 2x2 del sensor PROMEDIA cuatro fotodiodos en una muestra,
+  así que a exposición y ganancia fijas el nivel de señal NO sube; lo que baja
+  es el ruido temporal, a 0,44-0,48x, o sea +6,4 a +7,2 dB de SNR (medido por
+  Kengo Oki en una Surface Go 4 / ADL-N con controles fijos; algo mejor que
+  promediar cuatro píxeles del mismo color en software, coherente con que el
+  promediado ocurre antes de sumar el ruido de lectura una sola vez en lugar de
+  cuatro). En este Pro 7+ la ganancia analógica con AE convergido bajó de su
+  techo de 127 a ~15 al entrar el modo binned, pero esa comparación cambiaba
+  varias cosas a la vez y NO debe leerse como que el binning da diez veces más
+  señal. Requiere TODO esto a la vez:
   * PLL MIPI por modo: 0x30b3=0x70 binned / 0x83 full. Solo cambiar el PLL
     pasa el error de "Transfer FIFO overflow" a "Frame sync error" pero sigue
     negro.

@@ -97,11 +97,25 @@ Then any V4L2 viewer works: `ffplay /dev/video80`.
 
 The mainline `ov5693` driver defines a 1296x972 binned mode that never
 worked on the IPU6 — so every prior effort read the sensor at full
-2592x1944 resolution and downscaled, throwing away two stops of light and
-pinning the AGC at its maximum analogue gain (127 vs ~15): the familiar
-"working but unusably noisy" IPU6 front camera. Making binning actually
-stream required all of these at once, extracted from the mode tables of
-Windows' `ov5693.sys` ([`tools/extract_tables.py`](tools/extract_tables.py)):
+2592x1944 resolution and downscaled: the familiar "working but unusably
+noisy" IPU6 front camera.
+
+What binning actually buys, measured: hardware 2x2 binning **averages**
+four photodiodes into one output sample, so at fixed exposure and gain the
+signal level does not rise — the temporal noise drops instead, to
+0.44-0.48x, i.e. **+6.4 to +7.2 dB of SNR**, slightly better than
+averaging four same-colour pixels in software (consistent with the
+averaging happening before the read noise is added once rather than four
+times). Those numbers are Kengo Oki's, measured on a Surface Go 4 (ADL-N)
+under fixed controls; see the correction note below. On this Surface
+Pro 7+ the AGC-converged analogue gain fell from its 127 ceiling to ~15
+when the binned mode came up, but that comparison changed several things
+at once and should not be read as binning alone giving tenfold more
+signal.
+
+Making binning actually stream required all of these at once, extracted
+from the mode tables of Windows' `ov5693.sys`
+([`tools/extract_tables.py`](tools/extract_tables.py)):
 
 - a **per-mode MIPI PLL** (`0x30b3`: `0x70` binned / `0x83` full) and six
   per-mode analogue readout registers — the mainline driver programs the
@@ -298,6 +312,34 @@ camera comes out horizontally mirrored.
   remove/rescan of the IPU6 is fatal until reboot.
 - The libcamera and Intel HAL patches are local. See the upstream status
   below for what did land.
+
+## Correction note: what 2x2 binning measures (2026-09-28)
+
+The original version of this README and of the binned-mode patch justified
+the mode with "two stops of light" and an analogue gain falling from 127 to
+~15 on this machine. Kengo Oki then measured the mode properly on a Surface
+Go 4 (Alder Lake-N, `8086:462e`), under **fixed** exposure and gain rather
+than letting the AGC converge:
+
+- 2592x1944 full resolution: 300/300 frames, ~28.64 fps.
+- 1296x972 2x2 binned: 300/300 frames, ~28.64 fps, zero `Frame sync error`
+  and zero `Transfer FIFO overflow`; BGGR confirmed from raw with the
+  default `binned_y_offset=2`.
+- Signal level in binned mode: **the same** as full resolution, not four
+  times higher.
+- Temporal noise: 0.44-0.48x, i.e. **+6.4 to +7.2 dB SNR**, and slightly
+  better than software-averaging four same-colour pixels.
+
+So the sensor averages rather than sums, and the benefit of the mode is
+signal-to-noise, not exposure headroom. The 127-to-15 figure from this
+machine was an AGC-converged comparison that changed several things at once,
+and has been corrected wherever it appeared. His full write-up:
+https://github.com/Fugu0141/Surface-Go4-IPU6-camera-linux/blob/main/tests/2026-09-06-ov5693-binning-adln/RESULT.md
+
+His run also reproduced, on different silicon, the single
+`Inter-frame short/long packet discarded` pair that this machine logs at
+every stream start and that does not recur during the stream — so that is
+IPU6 stream-start noise, not a fault of either machine.
 
 ## Upstream status (honest version, as of 2026-09-22)
 

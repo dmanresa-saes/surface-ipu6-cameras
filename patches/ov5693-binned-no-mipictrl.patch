@@ -12,10 +12,12 @@ timing meant for twice the line length. The CSI-2 receiver reports
 "Transfer FIFO overflow" and every frame arrives empty.
 
 Users have therefore had to read the sensor at full resolution and
-downscale, which costs two stops of light. On the Surface Pro 7+ front
-camera the AGC sits at its analogue-gain ceiling in ordinary room light
-at full resolution; with 2x2 binning the gain needed for the same
-exposure drops about tenfold, and the noise with it.
+downscale. Hardware 2x2 binning averages four photodiodes per output
+sample: at fixed exposure and gain the signal level is unchanged, while
+the temporal noise drops to 0.44-0.48x, i.e. 6.4 to 7.2 dB more SNR
+(measured on a Surface Go 4, ADL-N). On the Surface Pro 7+ front camera
+the AGC also comes off its analogue-gain ceiling in ordinary room light
+once the binned mode is available.
 
 Make the binned mode work, following the vendor (Windows) driver's mode
 table:
