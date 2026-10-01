@@ -71,7 +71,7 @@ Lake, INT33BE) against raw captures at both resolutions and in all four
 flip states, with libcamera's software ISP and with the Intel IPU6 PSYS
 stack. The full-resolution register writes are unchanged.
 
-Assisted-by: LLM (Anthropic Claude, Fable 5)
+Assisted-by: LLM
 Signed-off-by: D. Manresa <dmanresa@gmail.com>
 ---
  drivers/media/i2c/ov5693.c | 155 ++++++++++++++++++++++++++++++++++---
