@@ -16,6 +16,7 @@
 #include <linux/platform_device.h>
 #include <linux/string_choices.h>
 #include <linux/uuid.h>
+#include <linux/version.h>
 
 /*
  * 79234640-9e10-4fea-a5c1-b5aa8b19756f
@@ -403,7 +404,11 @@ static int skl_int3472_handle_gpio_resources(struct acpi_resource *ares,
 
 			break;
 		case INT3472_GPIO_TYPE_PRIVACY_LED:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+			ret = skl_int3472_register_led(int3472, gpio, "privacy");
+#else
 			ret = skl_int3472_register_pled(int3472, gpio);
+#endif
 			if (ret)
 				err_msg = "Failed to register LED\n";
 
@@ -478,7 +483,11 @@ void int3472_discrete_cleanup(struct int3472_discrete_device *int3472)
 	gpiod_remove_lookup_table(&int3472->gpios);
 
 	skl_int3472_unregister_clock(int3472);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+	skl_int3472_unregister_leds(int3472);
+#else
 	skl_int3472_unregister_pled(int3472);
+#endif
 	skl_int3472_unregister_regulator(int3472);
 }
 EXPORT_SYMBOL_NS_GPL(int3472_discrete_cleanup, "INTEL_INT3472_DISCRETE");
