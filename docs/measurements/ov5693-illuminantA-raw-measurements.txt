@@ -37,7 +37,8 @@ shading de color de la lente (R cae hacia los bordes); el punto blanco OEM es de
 => Para neutralizar con G=1 hace falta ganancia R = 1/1.15 ~ 0.87 < 1. QED.
 Robustez: ratios estables (+-0.02) con exposicion x2.6 y ganancias distintas (senal x8 en wall).
 
-Note: the scene photo (ov5693-illuminantA-patches.jpg) is from a retake
+Note: the annotated scene photo that accompanied these regions is not
+published (it framed a private room). The region names below are from a retake
 under the same incandescent lamp with the room reframed; the patch
 coordinates and figures in this file refer to the original session
 (reprocessing its raws reproduces the table exactly). The retake, with a

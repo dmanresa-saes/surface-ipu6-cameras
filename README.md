@@ -22,14 +22,13 @@ is lit while the sensor streams, and the always-on relay design this replaced
 burned ~20% of a CPU and 3.3 GB of RAM producing a black picture nobody was
 looking at.
 
-Colour, next to Windows 11 rendering the same scene with the same module:
-
-![Linux (OEM tuning) vs Windows 11, same scene](docs/images/comparativa_oem.jpg)
-
-Full-size references: [Linux final](docs/images/linux_color_final.jpg) ·
-[W11 video frame](docs/images/w11_video_frame.png). Measured against the
-W11 render: white wall neutral to <2% (G/R 0.976 vs 0.965, G/B 1.007 vs
+Colour was validated against Windows 11 rendering the same scene with the
+same module: white wall neutral to <2% (G/R 0.976 vs 0.965, G/B 1.007 vs
 1.006), matched saturation (0.65 vs 0.64).
+
+The side-by-side captures are no longer published here — they were frames of
+a private room. The numbers they produced, and the per-region histograms
+behind them, are in [`docs/measurements/`](docs/measurements/).
 
 ## Quick start
 
