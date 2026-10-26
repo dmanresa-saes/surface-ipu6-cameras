@@ -340,10 +340,12 @@ His run also reproduced, on different silicon, the single
 every stream start and that does not recur during the stream — so that is
 IPU6 stream-start noise, not a fault of either machine.
 
-## Upstream status (honest version, as of 2026-09-22)
+## Upstream status (honest version, as of 2026-10-26)
 
-This is a snapshot, not a promise: the author no longer has the hardware, so
-nothing here will be re-tested by us. Anyone is welcome to pick any of it up.
+This is a snapshot, not a promise. The Surface Pro 7+ is being donated and
+will be gone shortly; until then it is still here and still able to run a
+test, so ask if you want one. After that nothing here will be re-tested by
+us. Anyone is welcome to pick any of it up at any point.
 
 **Landed / superseded upstream — prefer upstream over this repo:**
 
@@ -352,9 +354,16 @@ nothing here will be re-tested by us. Anyone is welcome to pick any of it up.
   properly — a `clock-noncontinuous` property per PCI ID in `ipu-bridge` plus
   an RMW of `BIT(5)` in the sensor — and went into media-committers `next` on
   **2026-09-11**. Of the four bits our `0x2d` set (0, 2, 3, 5) only bit 5
-  does anything: Fil Dunsky swept them on a Surface Pro 8, and we confirmed
-  it here by measuring that the CSI-2 error signature is identical with
-  `0x2d` and with bit-5-only. On a tree with that series, use
+  does anything: `Zann580` swept them on a Surface Pro 8 (linux-surface PR
+  [#2171](https://github.com/linux-surface/linux-surface/pull/2171#issuecomment-5298352360)),
+  `femito1` ran the same experiment on a Pro 9, and we confirmed it here by
+  measuring that the CSI-2 error signature is identical with `0x2d` and with
+  bit-5-only. **If you retest the gate, capture twice.** On `fildunsky`'s
+  Pro 8 the *first* capture of a boot succeeds even with the `INT33BE` + IPU6
+  entry removed, and only the second and later ones time out, so a single
+  capture after a reboot proves nothing. Two other testers see it fail on the
+  first attempt; nobody has explained the difference. On a tree with that
+  series, use
   [`patches/ov5693-binned-no-mipictrl.patch`](patches/ov5693-binned-no-mipictrl.patch).
 - A **third rodata literal** of the same class as the two our `ipu-bridge`
   1/2 fixes (`clock-noncontinuous`, introduced by that series) is fixed by
@@ -449,15 +458,36 @@ in this repository:
   `int3472` POWER1 patch our own patch now follows; a second Pro 7+ tested.
   He withdrew his `ov5693` [2/2] after reproducing our Bayer-phase
   measurements — the kind of exchange that makes a list worth writing to.
+- **`Zann580`** — Surface Pro 8: the bit sweep of `MIPI_CTRL00` that found
+  `BIT(5)` is the only one of our four that does anything, in linux-surface
+  PR [#2171](https://github.com/linux-surface/linux-surface/pull/2171#issuecomment-5298352360).
+  Earlier revisions of this file credited that sweep to the wrong person;
+  `fildunsky` corrected us on 2026-09-12.
+- **`femito1`** — Surface Pro 9: repeated that sweep on a second model.
 - **Fil Dunsky** (`fildunsky`) — Surface Pro 8: confirmed the binned OV5693
-  and the `int3472` rails on a second model, swept the bits of our
-  `MIPI_CTRL00 = 0x2d` down to the one that matters (`BIT(5)`), extracted the
-  vendor GPIO-type table from `iactrllogic64.sys` (`0x07` Power0, `0x08`
-  Power1, `0x0b` PowerEn, `0x10` Avdd, `0x11` Core) — which is how we learned
-  that mainline's name for type `0x10` is probably wrong — and reported the
-  empty `0x10` case that leaves a rail unpowered.
+  and the `int3472` rails on a second model, a `Tested-by` on Rimoli's v5,
+  and the negative control showing the `INT33BE` + IPU6 entry in that
+  series' patch 6 is load-bearing. He also extracted the vendor GPIO-type
+  table from `iactrllogic64.sys` (`0x07` Power0, `0x08` Power1, `0x0b`
+  PowerEn, `0x10` Avdd, `0x11` Core) — which is how we learned that
+  mainline's name for type `0x10` is probably wrong — and reported the empty
+  `0x10` case that leaves a rail unpowered.
 - **Kengo Oki** (`Fugu0141`) — Surface Go 4 (Alder Lake-N): testing on a
-  third IPU6 generation.
+  third IPU6 generation, and the fixed-exposure, fixed-gain run that
+  corrected us on what the binned mode buys: the sensor averages four
+  photodiodes rather than summing them, so the gain is signal-to-noise
+  (+6.4 to +7.2 dB), not exposure headroom.
+- **`CmdrShepardsPie`** — Surface Pro 9 (Alder Lake-P): the binned mode
+  confirmed on a second Alder Lake machine, and the `ov5693` mode-switch
+  diagnosis (`ov5693_set_fmt()` writes no registers, so
+  a format change inside the 1000 ms autosuspend window leaves the sensor on
+  the previous mode). That is a mainline bug this repository's patch only
+  makes easy to reach.
+- **`loafecho`** — Surface Pro 7 (Ice Lake, IPU4P): the binned patch on a
+  different CSI-2 receiver entirely, and the first one outside IPU6 —
+  10/10 clean starts of 45 frames each. His 0/10 comparison run is not a
+  clean stock baseline and he says so: that module carries a local hflip
+  fix whose default sets both horizontal flip bits.
 - **Fernando Rimoli** — the `clock-noncontinuous` series that supersedes our
   `MIPI_CTRL00` write and does it the right way, and the follow-up rodata
   fix.
