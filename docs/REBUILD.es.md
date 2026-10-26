@@ -114,7 +114,8 @@ encima. Qué hace y POR QUÉ (todo descubierto a base de sangre):
   propiedad `clock-noncontinuous` por PCI-ID en `ipu-bridge` (5/7-7/7) + un
   RMW del BIT(5) de MIPI_CTRL00 en el ov5693 (4/7) — y entró en la rama
   `next` de media-committers el 2026-09-11. De los bits de 0x2d (0, 2, 3 y
-  5) solo el 5 importa: barrido hecho por Fil Dunsky en una Surface Pro 8,
+  5) solo el 5 importa: barrido hecho por `Zann580` en una Surface Pro 8
+  (linux-surface PR #2171), repetido por Fernando Rimoli en una Pro 9,
   y verificado aquí midiendo que la firma de errores CSI-2 es idéntica con
   0x2d y con bit-5-solo. Si tu árbol ya trae la serie, usa
   `patches/ov5693-binned-no-mipictrl.patch` (nuestro binned SIN el 0x4800)

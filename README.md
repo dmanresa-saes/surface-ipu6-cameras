@@ -356,14 +356,14 @@ us. Anyone is welcome to pick any of it up at any point.
   **2026-09-11**. Of the four bits our `0x2d` set (0, 2, 3, 5) only bit 5
   does anything: `Zann580` swept them on a Surface Pro 8 (linux-surface PR
   [#2171](https://github.com/linux-surface/linux-surface/pull/2171#issuecomment-5298352360)),
-  `femito1` ran the same experiment on a Pro 9, and we confirmed it here by
-  measuring that the CSI-2 error signature is identical with `0x2d` and with
-  bit-5-only. **If you retest the gate, capture twice.** On `fildunsky`'s
+  Rimoli himself (`femito1`) ran the same experiment on a Pro 9, and we
+  confirmed it here by measuring that the CSI-2 error signature is identical
+  with `0x2d` and with bit-5-only. **If you retest the gate, capture twice.** On `fildunsky`'s
   Pro 8 the *first* capture of a boot succeeds even with the `INT33BE` + IPU6
   entry removed, and only the second and later ones time out, so a single
   capture after a reboot proves nothing. Two other testers see it fail on the
   first attempt; nobody has explained the difference. On a tree with that
-  series, use
+  series use
   [`patches/ov5693-binned-no-mipictrl.patch`](patches/ov5693-binned-no-mipictrl.patch).
 - A **third rodata literal** of the same class as the two our `ipu-bridge`
   1/2 fixes (`clock-noncontinuous`, introduced by that series) is fixed by
@@ -463,34 +463,34 @@ in this repository:
   PR [#2171](https://github.com/linux-surface/linux-surface/pull/2171#issuecomment-5298352360).
   Earlier revisions of this file credited that sweep to the wrong person;
   `fildunsky` corrected us on 2026-09-12.
-- **`femito1`** — Surface Pro 9: repeated that sweep on a second model.
 - **Fil Dunsky** (`fildunsky`) — Surface Pro 8: confirmed the binned OV5693
   and the `int3472` rails on a second model, a `Tested-by` on Rimoli's v5,
   and the negative control showing the `INT33BE` + IPU6 entry in that
-  series' patch 6 is load-bearing. He also extracted the vendor GPIO-type
-  table from `iactrllogic64.sys` (`0x07` Power0, `0x08` Power1, `0x0b`
-  PowerEn, `0x10` Avdd, `0x11` Core) — which is how we learned that
-  mainline's name for type `0x10` is probably wrong — and reported the empty
-  `0x10` case that leaves a rail unpowered.
+  series' patch 6 is load-bearing, plus the vendor GPIO-type table
+  (`0x07` Power0, `0x08` Power1, `0x0b` PowerEn, `0x10` Avdd, `0x11` Core)
+  extracted from `iactrllogic64.sys` — which is how we learned that
+  mainline's name for type `0x10` is probably wrong — and the report of the
+  empty `0x10` case that leaves a rail unpowered.
 - **Kengo Oki** (`Fugu0141`) — Surface Go 4 (Alder Lake-N): testing on a
   third IPU6 generation, and the fixed-exposure, fixed-gain run that
   corrected us on what the binned mode buys: the sensor averages four
   photodiodes rather than summing them, so the gain is signal-to-noise
   (+6.4 to +7.2 dB), not exposure headroom.
-- **`CmdrShepardsPie`** — Surface Pro 9 (Alder Lake-P): the binned mode
-  confirmed on a second Alder Lake machine, and the `ov5693` mode-switch
+- **Chris Simpson** (`CmdrShepardsPie`) — Surface Pro 9 (Alder Lake-P): the
+  binned mode confirmed on a second Alder Lake machine, and the `ov5693` mode-switch
   diagnosis (`ov5693_set_fmt()` writes no registers, so
   a format change inside the 1000 ms autosuspend window leaves the sensor on
   the previous mode). That is a mainline bug this repository's patch only
   makes easy to reach.
 - **`loafecho`** — Surface Pro 7 (Ice Lake, IPU4P): the binned patch on a
   different CSI-2 receiver entirely, and the first one outside IPU6 —
-  10/10 clean starts of 45 frames each. His 0/10 comparison run is not a
-  clean stock baseline and he says so: that module carries a local hflip
-  fix whose default sets both horizontal flip bits.
-- **Fernando Rimoli** — the `clock-noncontinuous` series that supersedes our
-  `MIPI_CTRL00` write and does it the right way, and the follow-up rodata
-  fix.
+  10/10 clean starts of 45 frames each. The 0/10 comparison run there is
+  not a clean stock baseline, as the report itself says: that module
+  carries a local hflip fix whose default sets both horizontal flip bits.
+- **Fernando Rimoli** (`femito1`) — the `clock-noncontinuous` series that
+  supersedes our `MIPI_CTRL00` write and does it the right way, the follow-up
+  rodata fix, the repeat of `Zann580`'s bit sweep on a Surface Pro 9, and the
+  Pro 9 `Tested-by` on our `ipu-bridge` series.
 - **Dan Scally** — the original Surface camera support (`int3472`,
   `ipu-bridge`, `cio2-bridge` before it) that every one of these machines
   stands on, and the `ov7251` `ANALOGUE_GAIN` patch.
