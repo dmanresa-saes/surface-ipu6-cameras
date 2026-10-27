@@ -1483,7 +1483,18 @@ OUT_W="${OUT_W:-1280}"
 OUT_H="${OUT_H:-720}"
 OUT_FPS="${OUT_FPS:-30/1}"
 
-export GST_PLUGIN_PATH=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
+# The libcamera GStreamer plugin lands wherever meson's libdir points:
+# /usr/local/lib/<triplet> on Debian/Ubuntu, /usr/local/lib64 on Fedora and
+# openSUSE, /usr/local/lib on Arch. Keep whichever candidates exist instead
+# of hardcoding one distribution's layout.
+for d in /usr/local/lib64/gstreamer-1.0 \
+         /usr/local/lib/*-linux-gnu/gstreamer-1.0 \
+         /usr/local/lib/gstreamer-1.0; do
+    if [ -d "$d" ]; then
+        GST_PLUGIN_PATH="${GST_PLUGIN_PATH:+$GST_PLUGIN_PATH:}$d"
+    fi
+done
+export GST_PLUGIN_PATH
 
 DEVICE=$(grep -l -m1 -F -x "$LABEL" /sys/devices/virtual/video4linux/*/name | cut -d/ -f6)
 if [ -z "$DEVICE" ]; then
@@ -2273,6 +2284,7 @@ measured bug and must be kept verbatim (see REPRODUCIR.md s.4/s.6):
 """
 
 import fcntl
+import glob
 import os
 import select
 import signal
@@ -2285,7 +2297,16 @@ W, H, FPS = 1280, 720, 30
 FRAME_SIZE = W * H * 2
 LOOPBACK_LABEL = "Surface Rear Camera"
 CAM_ID = r"\\_SB_.PC00.I2C3.CAMR"   # gst_parse_launch eats one backslash level
-GST_PLUGIN_PATH = "/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0"
+# The libcamera GStreamer plugin lands wherever meson's libdir points:
+# /usr/local/lib/<triplet> on Debian/Ubuntu, /usr/local/lib64 on Fedora and
+# openSUSE, /usr/local/lib on Arch. Keep whichever candidates exist instead
+# of hardcoding one distribution's layout.
+GST_PLUGIN_PATH = ":".join(
+    d for pattern in ("/usr/local/lib64/gstreamer-1.0",
+                      "/usr/local/lib/*-linux-gnu/gstreamer-1.0",
+                      "/usr/local/lib/gstreamer-1.0")
+    for d in sorted(glob.glob(pattern))
+)
 
 GST_CMD = [
     "gst-launch-1.0", "-q",
